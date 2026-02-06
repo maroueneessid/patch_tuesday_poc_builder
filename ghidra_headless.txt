@@ -1,0 +1,1 @@
+C:\MyProgs\Ghidra\ghidra_11.0.3_PUBLIC\support\analyzeHeadless.bat "C:\MyProgs\Ghidra\Projects" "raas" -import "C:\Users\User\Desktop\optimal_dffing\unpatched" -postScript "C:\MyProgs\Ghidra\Scripts\exportBinExport.java" "C:\Users\User\Desktop\optimal_dffing\unpatched" "unpatched"
