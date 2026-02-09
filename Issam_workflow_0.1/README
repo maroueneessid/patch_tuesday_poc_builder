@@ -1,0 +1,7 @@
+##Workflow steps: 
+
+1. Pull all dll's from previous update.
+2. Update to newest kb. 
+3. run windows_updated_log_parser.py to get all updated dll's from C:\Windows\Logs\CBS\CBS-{kbnumber}.log
+4. run dll_downloader with argument the generated rs file. This will download all modified dll's that are found tagged with the new kb in winbindex. 
+
