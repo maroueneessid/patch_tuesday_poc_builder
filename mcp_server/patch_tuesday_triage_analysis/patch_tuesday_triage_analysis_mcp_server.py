@@ -2,17 +2,22 @@
 """
 patch_tuesday_mcp_server.py — MCP server for Patch Tuesday research workflow.
 
-Combines CVE fetching (MSRC CVRF API) and patched/vulnerable binary downloading
-(WinBIndex + Microsoft Symbol Server) into a single MCP server.
+Combines CVE fetching (MSRC CVRF API), patched/vulnerable binary downloading
+(WinBIndex + Microsoft Symbol Server), and PE index search into a single MCP server.
+
+Configuration (all env vars):
+    BASE_DIR             — directory for downloaded binaries (default: ./patch_bins)
+    PE_INDEX_DB          — path to pe-index ChromaDB (optional, enables search_pe_* tools)
+    PE_INDEX_COLLECTION  — ChromaDB collection name (default: pe_files)
+    PE_INDEX_EMBED_URL   — embedding endpoint (default: http://localhost:1234/v1)
+    PE_INDEX_EMBED_MODEL — embedding model (default: text-embedding-nomic-embed-text-v1.5@f32)
 
 Usage:
-    python patch_tuesday_mcp_server.py --base-dir /path/to/research
-    BASE_DIR=/path/to/research python patch_tuesday_mcp_server.py
+    BASE_DIR=./research PE_INDEX_DB=./pe-index.chromadb python patch_tuesday_mcp_server.py
 
-All downloaded files are placed inside {base_dir}/{CVE_ID}/ — never loose in base_dir.
+All downloaded files are placed inside {BASE_DIR}/{CVE_ID}/.
 """
 
-import argparse
 import gzip
 import json
 import os
@@ -22,12 +27,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import chromadb
 import pefile
 import requests
+from openai import OpenAI
 from mcp.server.fastmcp import FastMCP
 
 SYSTEM32 = Path(r"C:\Windows\System32")
 DRIVERS  = SYSTEM32 / "drivers"
+
+# ── PE Index config ──────────────────────────────────────────────────────────
+
+PE_INDEX_DB         = os.environ.get("PE_INDEX_DB", "")
+PE_INDEX_COLLECTION = os.environ.get("PE_INDEX_COLLECTION", "pe_files")
+PE_INDEX_EMBED_URL  = os.environ.get("PE_INDEX_EMBED_URL", "http://localhost:1234/v1")
+PE_INDEX_EMBED_MODEL = os.environ.get(
+    "PE_INDEX_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5@f32"
+)
 
 
 def _resolve_pe_path(filename: str) -> Optional[Path]:
@@ -63,14 +79,7 @@ MSRC_CVE_URL = "https://api.msrc.microsoft.com/sug/v2.0/en-US/vulnerability"
 MSRC_CVRF_URL = "https://api.msrc.microsoft.com/cvrf"
 
 
-def _parse_base_dir() -> str:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--base-dir", default=os.environ.get("BASE_DIR", "./patch_bins"))
-    args, _ = parser.parse_known_args()
-    return os.path.abspath(args.base_dir)
-
-
-BASE_DIR = _parse_base_dir()
+BASE_DIR = os.path.abspath(os.environ.get("BASE_DIR", "./patch_bins"))
 mcp = FastMCP("patch-tuesday")
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
@@ -353,8 +362,7 @@ def download_patch_binaries(
     """Download patched and vulnerable Windows binaries for a CVE.
 
     Files are saved to {base_dir}/{cve_id}/ (created automatically).
-    The base_dir is configured when the server starts via --base-dir or
-    the BASE_DIR environment variable.
+    The base_dir is configured via the BASE_DIR environment variable.
 
     Resolution rules:
     - If filename is omitted: the binary is resolved from COMPONENT_MAP using
@@ -558,6 +566,136 @@ def list_iat(filename: str) -> Dict[str, Any]:
         })
 
     result["dlls"] = dlls
+    return result
+
+
+# ── PE Index tools ───────────────────────────────────────────────────────────
+
+
+def _pe_index_available() -> bool:
+    return bool(PE_INDEX_DB) and os.path.isdir(os.path.expanduser(PE_INDEX_DB))
+
+
+def _pe_index_collection():
+    db = chromadb.PersistentClient(path=os.path.expanduser(PE_INDEX_DB))
+    return db.get_or_create_collection(
+        name=PE_INDEX_COLLECTION, metadata={"hnsw:space": "cosine"}
+    )
+
+
+def _pe_index_embed(text: str):
+    client = OpenAI(base_url=PE_INDEX_EMBED_URL, api_key="lm-studio")
+    resp = client.embeddings.create(model=PE_INDEX_EMBED_MODEL, input=[text])
+    return resp.data[0].embedding
+
+
+def _extract_description(doc_text: str) -> Optional[str]:
+    """Pull the Description line out of a pe-index markdown document."""
+    parts = doc_text.split("**Description:** ")
+    if len(parts) > 1:
+        return parts[1].split("\n")[0].strip()
+    return None
+
+
+@mcp.tool()
+def search_pe_by_description(keyword: str, top_k: int = 10) -> Dict[str, Any]:
+    """Search Windows PE files (DLL/EXE/SYS) by their FileDescription.
+
+    Resolves an MSRC vulnerability title or subsystem name to the actual binary.
+    For example: 'mailslot' → msfs.sys, 'telephony' → tapisrv.dll.
+
+    Searches a pre-built index of ~4700 PE files from System32 and drivers.
+
+    Args:
+        keyword: Subsystem or description keywords from the CVE title.
+                 Use the feature name, NOT the CVE ID.
+        top_k: Number of results (default 10, max 20).
+    """
+    result: Dict[str, Any] = {"results": [], "count": 0, "error": None}
+
+    if not _pe_index_available():
+        result["error"] = "PE_INDEX_DB not configured or path does not exist."
+        return result
+
+    top_k = min(max(top_k, 1), 20)
+
+    try:
+        col = _pe_index_collection()
+        qe = _pe_index_embed(keyword)
+        raw = col.query(
+            query_embeddings=[qe],
+            n_results=top_k,
+            where={"source": "pe-index"},
+            include=["documents", "metadatas", "distances"],
+        )
+
+        if not raw["ids"][0]:
+            return result
+
+        for i in range(len(raw["ids"][0])):
+            meta = raw["metadatas"][0][i]
+            dist = raw["distances"][0][i]
+            desc = _extract_description(raw["documents"][0][i])
+            result["results"].append({
+                "name": meta.get("name", "?"),
+                "description": desc,
+                "type": meta.get("type", "?"),
+                "location": meta.get("location", "?"),
+                "version": meta.get("version", ""),
+                "similarity": round(1 - dist, 4),
+            })
+
+        result["count"] = len(result["results"])
+    except Exception as e:
+        result["error"] = f"PE index search error: {e}"
+
+    return result
+
+
+@mcp.tool()
+def search_pe_by_name(filename: str) -> Dict[str, Any]:
+    """Look up a PE file by exact filename to get its description and metadata.
+
+    Use when you have a filename and want to confirm what component it is
+    (e.g. that profsvc.dll is 'User Profile Service').
+
+    Args:
+        filename: Exact PE filename, e.g. 'msfs.sys', 'profsvc.dll'.
+    """
+    result: Dict[str, Any] = {
+        "name": filename,
+        "description": None,
+        "type": None,
+        "location": None,
+        "version": None,
+        "found": False,
+        "error": None,
+    }
+
+    if not _pe_index_available():
+        result["error"] = "PE_INDEX_DB not configured or path does not exist."
+        return result
+
+    try:
+        col = _pe_index_collection()
+        raw = col.get(
+            where={"$and": [{"source": "pe-index"}, {"name": filename}]},
+            include=["documents", "metadatas"],
+        )
+
+        if not raw["ids"]:
+            return result
+
+        meta = raw["metadatas"][0]
+        result["found"] = True
+        result["type"] = meta.get("type")
+        result["location"] = meta.get("location")
+        result["version"] = meta.get("version")
+        result["description"] = _extract_description(raw["documents"][0])
+
+    except Exception as e:
+        result["error"] = f"PE index lookup error: {e}"
+
     return result
 
 
