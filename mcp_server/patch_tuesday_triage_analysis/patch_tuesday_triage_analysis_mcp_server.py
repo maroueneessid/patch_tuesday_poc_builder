@@ -2,8 +2,10 @@
 """
 patch_tuesday_mcp_server.py — MCP server for Patch Tuesday research workflow.
 
-Combines CVE fetching (MSRC CVRF API), patched/vulnerable binary downloading
-(WinBIndex + Microsoft Symbol Server), and PE index search into a single MCP server.
+KB-CSV-based workflow: for a given Patch Tuesday month and Windows platform,
+fetches Microsoft's file-version manifest CSV for the cumulative update KB,
+filters for .exe/.dll/.sys, and diffs against the previous month's KB to find
+files that actually changed version (not just repackaged).
 
 Configuration (all env vars):
     BASE_DIR             — directory for downloaded binaries (default: ./patch_bins)
@@ -14,11 +16,11 @@ Configuration (all env vars):
 
 Usage:
     BASE_DIR=./research PE_INDEX_DB=./pe-index.chromadb python patch_tuesday_mcp_server.py
-
-All downloaded files are placed inside {BASE_DIR}/{CVE_ID}/.
 """
 
+import csv
 import gzip
+import io
 import json
 import os
 import tempfile
@@ -30,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import chromadb
 import pefile
 import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
 from mcp.server.fastmcp import FastMCP
 
@@ -38,49 +41,38 @@ DRIVERS  = SYSTEM32 / "drivers"
 
 # ── PE Index config ──────────────────────────────────────────────────────────
 
-PE_INDEX_DB         = os.environ.get("PE_INDEX_DB", "")
-PE_INDEX_COLLECTION = os.environ.get("PE_INDEX_COLLECTION", "pe_files")
-PE_INDEX_EMBED_URL  = os.environ.get("PE_INDEX_EMBED_URL", "http://localhost:1234/v1")
+PE_INDEX_DB          = os.environ.get("PE_INDEX_DB", "")
+PE_INDEX_COLLECTION  = os.environ.get("PE_INDEX_COLLECTION", "pe_files")
+PE_INDEX_EMBED_URL   = os.environ.get("PE_INDEX_EMBED_URL", "http://localhost:1234/v1")
 PE_INDEX_EMBED_MODEL = os.environ.get(
     "PE_INDEX_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5@f32"
 )
 
-
-def _resolve_pe_path(filename: str) -> Optional[Path]:
-    """Return the first existing path for filename in System32 or drivers\\."""
-    for base in (SYSTEM32, DRIVERS):
-        p = base / filename
-        if p.exists():
-            return p
-    return None
-
-# ── Import pure helpers from original scripts (no sys.exit on import) ─────────
+# ── Import CVE helpers ────────────────────────────────────────────────────────
 
 from fetch_patch_tuesday_interesting_vulns import (
     get_severity,
     get_cvss_info,
 )
 
-from fetch_cve_related_pre_post_patch_binaries import (
-    COMPONENT_MAP,
-    MONTH_NAMES,
-    DEFAULT_WINDOWS_VERSION,
-    WINBINDEX_URL,
-    SYMBOL_SERVER_URL,
-    validate_cve,
-    get_patch_tuesday,       # noqa: F401 — used by select_versions internally
-    is_near_patch_tuesday,   # noqa: F401 — used by select_versions internally
-    select_versions,
-)
-
 # ── Server setup ──────────────────────────────────────────────────────────────
 
-MSRC_CVE_URL = "https://api.msrc.microsoft.com/sug/v2.0/en-US/vulnerability"
 MSRC_CVRF_URL = "https://api.msrc.microsoft.com/cvrf"
-
 
 BASE_DIR = os.path.abspath(os.environ.get("BASE_DIR", "./patch_bins"))
 mcp = FastMCP("patch-tuesday")
+
+# Maps user-friendly windows_version strings to MSRC ProductID strings used in
+# CVRF Remediation entries. IDs are stable across all monthly CVRF documents.
+# 20438 = Windows 11 25H2 x64, 20437 = Windows 11 25H2 ARM64.
+# Only x64 is tracked here; ARM64 shares the same KB but a different CSV section.
+WINDOWS_VERSION_PRODUCT_IDS: Dict[str, List[str]] = {
+    "11-25H2": ["20438"],
+}
+
+DEFAULT_WINDOWS_VERSION = "11-25H2"
+
+_EXECUTABLE_EXTENSIONS = {".exe", ".dll", ".sys"}
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
 
@@ -115,7 +107,7 @@ def _stream_to_file(url: str, dest: str, timeout: int = 120) -> None:
             f.write(chunk)
 
 
-# ── Exploitability helpers — highest severity wins across all Type==1 entries ─
+# ── Exploitability helpers ────────────────────────────────────────────────────
 
 _EXPLOIT_RANK: Dict[str, int] = {
     "exploitation detected": 2,
@@ -124,13 +116,7 @@ _EXPLOIT_RANK: Dict[str, int] = {
 
 
 def _get_best_exploitability(vuln: Dict) -> Optional[str]:
-    """Return the highest-severity exploitability string across all Type==1 Threats.
-
-    CVRF documents can have multiple Type==1 Threat entries for the same CVE
-    (one per affected product). We pick the worst-case entry rather than the
-    first, to avoid misclassifying a CVE because a lower-risk product appeared
-    first in the array.
-    """
+    """Return the highest-severity exploitability string across all Type==1 Threats."""
     best_rank = -1
     best_val: Optional[str] = None
     for threat in vuln.get("Threats", []):
@@ -154,187 +140,280 @@ def _is_high_exploitability(exploit_str: Optional[str]) -> bool:
     return "exploitation detected" in low or "exploitation more likely" in low
 
 
-# ── CVE → filename + patch month resolution ───────────────────────────────────
+# ── PE path helper ────────────────────────────────────────────────────────────
 
 
-def _resolve_cve(cve_id: str) -> Tuple[str, List[str], str]:
-    """Query MSRC and return (tag, [filenames_from_map], patch_month YYYY-MM).
+def _resolve_pe_path(filename: str) -> Optional[Path]:
+    """Return the first existing path for filename in System32 or drivers\\."""
+    for base in (SYSTEM32, DRIVERS):
+        p = base / filename
+        if p.exists():
+            return p
+    return None
 
-    Raises RuntimeError / ValueError on failure. Never calls sys.exit.
+
+# ── KB CSV workflow helpers ───────────────────────────────────────────────────
+
+
+def _parse_month(month: str) -> datetime:
+    """Parse YYYY-MM or YYYY-Mon into a datetime. Raises ValueError if invalid."""
+    for fmt in ("%Y-%m", "%Y-%b"):
+        try:
+            return datetime.strptime(month, fmt)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Invalid month format '{month}'. Use YYYY-MM or YYYY-Mon (e.g. 2025-04, 2025-Apr)."
+    )
+
+
+def _get_previous_month(month: str) -> str:
+    """Return the YYYY-Mon string for the month preceding *month*."""
+    dt = _parse_month(month)
+    if dt.month == 1:
+        prev = dt.replace(year=dt.year - 1, month=12)
+    else:
+        prev = dt.replace(month=dt.month - 1)
+    return prev.strftime("%Y-%b")
+
+
+def _extract_kb_for_vuln(vuln: Dict, target_ids: set) -> Optional[str]:
+    """Return the Security Update KB number for target_ids from a vuln's Remediations.
+
+    In CVRF JSON: Type==2 is Vendor Fix, Type==3 is Release Notes, Type==6 is
+    Known Issue. SubType filters out Hotpatch and Monthly Rollup entries.
     """
-    url = f"{MSRC_CVE_URL}/{cve_id}"
-    r = _http_get(url, headers={"Accept": "application/json"}, timeout=30)
-    if r.status_code == 404:
-        raise RuntimeError(f"{cve_id} not found in the Microsoft database")
+    for rem in vuln.get("Remediations", []):
+        if rem.get("Type") != 2:
+            continue
+        if rem.get("SubType") != "Security Update":
+            continue
+        if not set(rem.get("ProductID", [])) & target_ids:
+            continue
+        desc = rem.get("Description", {})
+        kb = desc.get("Value", "").strip() if isinstance(desc, dict) else ""
+        if kb:
+            return kb
+    return None
+
+
+def _fetch_kb_for_platform(month: str, windows_version: str) -> Optional[str]:
+    """Return the Security Update KB number for *windows_version* in *month*.
+
+    Fetches the MSRC CVRF document for *month* and returns the first KB found
+    via _extract_kb_for_vuln across all vulnerabilities. Returns None if no
+    match is found.
+
+    Args:
+        month: YYYY-MM or YYYY-Mon (e.g. '2025-04' or '2025-Apr').
+        windows_version: Key from WINDOWS_VERSION_PRODUCT_IDS (e.g. '11-25H2').
+
+    Raises:
+        ValueError: If windows_version is not in WINDOWS_VERSION_PRODUCT_IDS.
+    """
+    target_ids = set(WINDOWS_VERSION_PRODUCT_IDS.get(windows_version, []))
+    if not target_ids:
+        raise ValueError(
+            f"Unknown windows_version '{windows_version}'. "
+            f"Known: {list(WINDOWS_VERSION_PRODUCT_IDS)}"
+        )
+
+    dt = _parse_month(month)
+    slug = f"{dt.year}-{dt.strftime('%b')}"
+
+    r = _http_get(f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"MSRC API returned HTTP {r.status_code} for {cve_id}")
+        raise RuntimeError(f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'.")
 
-    data = r.json()
-    tag: str = data.get("tag", "")
-    if tag.startswith("Role: "):
-        tag = tag[6:]
+    for vuln in r.json().get("Vulnerability", []):
+        kb = _extract_kb_for_vuln(vuln, target_ids)
+        if kb:
+            return kb
 
-    filenames = [c["file"] for c in COMPONENT_MAP if c["name"] == tag]
-
-    release_number: str = data.get("releaseNumber") or ""
-    if not release_number or "-" not in release_number:
-        raise ValueError(
-            f"Cannot determine patch month: MSRC returned "
-            f"releaseNumber='{release_number}' for {cve_id}. "
-            "Use download_patch_binaries with filename= and re-check manually."
-        )
-    try:
-        year, month_name = release_number.split("-", 1)
-        patch_month = f"{year}-{MONTH_NAMES[month_name]}"
-    except KeyError:
-        raise ValueError(
-            f"Unknown month abbreviation in releaseNumber '{release_number}'. "
-            "Expected format: YYYY-Mon (e.g. 2025-Apr)."
-        )
-
-    return tag, filenames, patch_month
+    return None
 
 
-# ── COMPONENT_MAP grouped helper ──────────────────────────────────────────────
+def _fetch_kb_file_list(kb_number: str, arch: str = "x64") -> List[Dict[str, str]]:
+    """Fetch Microsoft's file-version CSV for a KB and return filtered rows.
 
+    Fetches https://support.microsoft.com/help/{kb_number}, finds the
+    ocpExternalLink anchor whose text contains 'download the file information
+    for cumulative update {kb_number}', downloads the CSV via the fwlink URL,
+    and returns only rows for .exe/.dll/.sys files from sections matching *arch*.
 
-def _grouped_component_map() -> List[Dict[str, Any]]:
-    groups: Dict[str, List[str]] = {}
-    for entry in COMPONENT_MAP:
-        groups.setdefault(entry["name"], []).append(entry["file"])
-    return [{"tag_name": k, "filenames": v} for k, v in groups.items()]
+    Args:
+        kb_number: Bare KB number without 'KB' prefix, e.g. '5077181'.
+        arch: Architecture substring to match in section titles, e.g. 'x64'.
+              Only rows from sections whose title contains this string are returned.
 
+    Returns:
+        List of dicts with keys: file_name, file_version, file_size, date, time.
 
-# ── Binary download pipeline ──────────────────────────────────────────────────
-
-
-def _download_pair(
-    filename: str,
-    patch_month: str,
-    output_dir: str,
-    windows_version: str,
-) -> Dict[str, Any]:
-    """Download patched + vulnerable binaries for one filename into output_dir.
-
-    WinBIndex .json.gz is kept in a TemporaryDirectory and never written to
-    output_dir. Returns a result dict; on failure, sets 'error' and returns
-    early without raising so callers can surface the message cleanly.
+    Raises:
+        RuntimeError: If the support page is unreachable, the CSV link is not
+                      found, or the CSV download fails.
     """
-    result: Dict[str, Any] = {
-        "filename": filename,
-        "patched_path": None,
-        "vulnerable_path": None,
-        "patched_version": None,
-        "vulnerable_version": None,
-        "kb_id": None,
-        "error": None,
-    }
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Step 1: fetch WinBIndex database
-        db_url = f"{WINBINDEX_URL}/{filename}.json.gz"
-        db_path = os.path.join(tmpdir, f"{Path(filename).stem}.json.gz")
-        try:
-            _stream_to_file(db_url, db_path, timeout=60)
-        except RuntimeError as exc:
-            result["error"] = f"WinBIndex fetch failed for '{filename}': {exc}"
-            return result
-
-        # Step 2: select patched / vulnerable versions (pure, no HTTP)
-        patched, vulnerable = select_versions(db_path, windows_version, patch_month)
-
-    if not patched:
-        result["error"] = (
-            f"No patched version found for '{filename}' "
-            f"on {windows_version} in {patch_month}. "
-            "Try a different windows_version."
+    support_url = f"https://support.microsoft.com/help/{kb_number}"
+    r = _http_get(support_url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Support page returned HTTP {r.status_code} for KB {kb_number} ({support_url})"
         )
-        return result
-    if not vulnerable:
-        result["error"] = (
-            f"No vulnerable version found for '{filename}' "
-            f"on {windows_version} prior to {patch_month}. "
-            "Try a different windows_version."
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    csv_url: Optional[str] = None
+    target_text = f"download the file information for cumulative update {kb_number.lower()}"
+
+    # Primary: exact anchor text match
+    for a in soup.find_all("a", class_="ocpExternalLink"):
+        if target_text in a.get_text(strip=True).lower():
+            csv_url = a.get("href", "").strip()
+            break
+
+    # Fallback: any ocpExternalLink with 'file information' pointing to fwlink
+    if not csv_url:
+        for a in soup.find_all("a", class_="ocpExternalLink"):
+            href = a.get("href", "")
+            if "go.microsoft.com/fwlink" in href and "file information" in a.get_text(strip=True).lower():
+                csv_url = href.strip()
+                break
+
+    if not csv_url:
+        raise RuntimeError(
+            f"Could not find CSV download link on {support_url}. "
+            "The page may require JavaScript rendering or the link text pattern changed."
         )
-        return result
 
-    result["kb_id"] = patched.get("kb_id")
-    result["patched_version"] = patched["release_version"]
-    result["vulnerable_version"] = vulnerable["release_version"]
+    r2 = _http_get(csv_url, timeout=60)
+    if r2.status_code != 200:
+        raise RuntimeError(
+            f"CSV download failed HTTP {r2.status_code} from {csv_url}"
+        )
 
-    # Step 3: download both binaries from Symbol Server
-    stem = Path(filename).stem
-    ext = Path(filename).suffix
+    content = r2.content.decode("utf-8-sig")
 
-    for ver_info, label, path_key in (
-        (patched, "patched", "patched_path"),
-        (vulnerable, "vulnerable", "vulnerable_path"),
-    ):
-        ts_hex = f"{int(ver_info['timestamp']):08X}"
-        sz_hex = f"{int(ver_info['virtual_size']):X}"
-        bin_url = f"{SYMBOL_SERVER_URL}/{filename}/{ts_hex}{sz_hex}/{filename}"
-        local_name = f"{stem}_{ver_info['release_version']}{ext}"
-        local_path = os.path.join(output_dir, local_name)
-        try:
-            _stream_to_file(bin_url, local_path, timeout=120)
-        except RuntimeError as exc:
-            result["error"] = f"Symbol Server download failed for {label} '{filename}': {exc}"
-            return result
-        result[path_key] = local_path
+    # The CSV has section-title rows before each real header, e.g.:
+    #   "Windows 11, version 25H2 LCU x64-based"  ← section title
+    #   "File name, File version, Date, Time, File size"  ← header
+    #   "foo.dll, 10.0.26200.xxx, ..."  ← data
+    # Multiple sections (one per arch) separated by blank lines.
+    # Only collect rows from sections whose title contains *arch*.
+    rows: List[Dict[str, str]] = []
+    current_headers: Optional[List[str]] = None
+    in_target_section: bool = False
+    for line in content.splitlines():
+        if not line.strip():
+            current_headers = None
+            in_target_section = False
+            continue
+        row = next(csv.reader([line]))
+        if not row:
+            continue
+        if row[0].strip() == "File name":
+            current_headers = [c.strip() for c in row]
+            continue
+        if current_headers is None:
+            # Section title row — check if it matches target arch
+            section_title = " ".join(row).lower()
+            in_target_section = arch.lower() in section_title
+            continue
+        if not in_target_section:
+            continue
+        entry = {
+            current_headers[i]: row[i].strip() if i < len(row) else ""
+            for i in range(len(current_headers))
+        }
+        fname = entry.get("File name", "")
+        basename = fname.replace("\\", "/").split("/")[-1]
+        ext = os.path.splitext(basename)[1].lower()
+        if ext not in _EXECUTABLE_EXTENSIONS:
+            continue
+        rows.append({
+            "file_name": basename,
+            "file_version": entry.get("File version", ""),
+            "file_size": entry.get("File size", ""),
+            "date": entry.get("Date", ""),
+            "time": entry.get("Time", ""),
+        })
+    return rows
 
-    return result
+
+def _version_tuple(ver: str) -> tuple:
+    """Convert '10.0.26100.3915' to (10, 0, 26100, 3915) for comparison."""
+    try:
+        return tuple(int(x) for x in ver.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _compare_kb_files(
+    current: List[Dict[str, str]],
+    previous: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Return entries from *current* whose version differs from *previous*.
+
+    Files new in current (absent from previous) are included with
+    previous_version=None. Arch variants (e.g. x64 and arm64 copies of the
+    same basename) are deduplicated by keeping the highest version per basename.
+
+    Args:
+        current: File list from the current month's KB CSV.
+        previous: File list from the previous month's KB CSV.
+
+    Returns:
+        Subset of *current* (deduplicated by basename) augmented with a
+        'previous_version' key.
+    """
+    # Build previous map: lowercase basename → highest version seen
+    prev_map: Dict[str, str] = {}
+    for entry in previous:
+        fname = entry["file_name"].lower()
+        ver = entry["file_version"]
+        existing = prev_map.get(fname)
+        if existing is None or _version_tuple(ver) > _version_tuple(existing):
+            prev_map[fname] = ver
+
+    changed: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entry in current:
+        fname = entry["file_name"].lower()
+        if fname in seen:
+            continue
+        seen.add(fname)
+        prev_ver = prev_map.get(fname)
+        curr_ver = entry["file_version"]
+        if prev_ver is None or curr_ver != prev_ver:
+            changed.append({**entry, "previous_version": prev_ver})
+    return changed
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
-def fetch_patch_tuesday_cves(month: str = "", api_token: str = "") -> List[Dict[str, Any]]:
+def fetch_patch_tuesday_cves(month: str = "") -> List[Dict[str, Any]]:
     """Fetch high-exploitability CVEs from a Patch Tuesday month.
 
     Returns CVEs where exploitability is 'Exploitation Detected' or
-    'Exploitation More Likely'. Use the returned CVE_IDs with
-    download_patch_binaries to fetch the corresponding binaries.
+    'Exploitation More Likely'.
 
     Args:
         month: Target month as YYYY-MM or YYYY-Mon (e.g. '2025-03' or '2025-Mar').
                Defaults to the current month.
-        api_token: Optional Azure AD bearer token — required for months older
-                   than the current one.
 
     Returns:
         List of dicts: {CVE_ID, Title, Severity, Exploitability,
-                        CVSS_BaseScore, CVSS_Vector}
+                        CVSS_BaseScore, CVSS_Vector, KB}
     """
-    headers: Dict[str, str] = {"Accept": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
-
-    if month:
-        for fmt in ("%Y-%m", "%Y-%b"):
-            try:
-                dt = datetime.strptime(month, fmt)
-                break
-            except ValueError:
-                continue
-        else:
-            raise ValueError(
-                f"Invalid month format '{month}'. Use YYYY-MM or YYYY-Mon "
-                "(e.g. 2025-03, 2025-Mar)."
-            )
-    else:
-        dt = datetime.now()
-
+    dt = _parse_month(month) if month else datetime.now()
     slug = f"{dt.year}-{dt.strftime('%b')}"
-    r = _http_get(f"{MSRC_CVRF_URL}/{slug}", headers=headers, timeout=30)
-    if r.status_code == 401:
-        raise PermissionError("MSRC API: Unauthorized — api_token required for historical data.")
+
+    r = _http_get(f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'.")
 
     vulnerabilities = r.json().get("Vulnerability", [])
+    target_ids = set(WINDOWS_VERSION_PRODUCT_IDS[DEFAULT_WINDOWS_VERSION])
     cves = []
     for vuln in vulnerabilities:
         exploit_str = _get_best_exploitability(vuln)
@@ -349,114 +428,150 @@ def fetch_patch_tuesday_cves(month: str = "", api_token: str = "") -> List[Dict[
             "Exploitability": exploit_str,
             "CVSS_BaseScore": cvss["BaseScore"],
             "CVSS_Vector": cvss["Vector"],
+            "KB": _extract_kb_for_vuln(vuln, target_ids),
         })
     return cves
 
 
 @mcp.tool()
-def download_patch_binaries(
-    cve_id: str,
-    filename: str = "",
+def fetch_kb_updated_files(
+    month: str = "",
     windows_version: str = DEFAULT_WINDOWS_VERSION,
-) -> Dict[str, Any]:
-    """Download patched and vulnerable Windows binaries for a CVE.
+    compare_with_previous: bool = True,
+) -> str:
+    """Fetch .exe/.dll/.sys files updated in a Patch Tuesday KB and save to CSV.
 
-    Files are saved to {base_dir}/{cve_id}/ (created automatically).
-    The base_dir is configured via the BASE_DIR environment variable.
+    Resolves the cumulative update KB from MSRC CVRF, downloads Microsoft's
+    file-version CSV, diffs against the previous month to find version-changed
+    files, enriches each with its local PE FileDescription, and writes the full
+    result to BASE_DIR as a CSV file.
 
-    Resolution rules:
-    - If filename is omitted: the binary is resolved from COMPONENT_MAP using
-      the CVE's MSRC security tag. If the tag maps to multiple files (e.g.
-      'Windows Hyper-V' → 4 files), an error is returned listing the candidates
-      — re-call with the specific filename you want.
-    - If filename is provided: COMPONENT_MAP is bypassed entirely; the patch
-      month is still resolved from MSRC using the CVE ID.
-
-    After a successful download the result includes kb_id — the KB article that
-    patched this binary. Pass extra filenames you suspect were co-patched in
-    that KB to additional download_patch_binaries calls.
+    Returns a one-line summary string (path + counts) — no large payload.
 
     Args:
-        cve_id: CVE identifier, e.g. 'CVE-2025-29824'.
-        filename: Binary filename to download, e.g. 'clfs.sys'. Optional.
-        windows_version: Target Windows version (default: '11-24H2').
-
-    Returns:
-        Dict with keys: cve_id, tag, patch_month, kb_id, filename,
-        patched_path, vulnerable_path, patched_version, vulnerable_version, error.
-        On success, error is None. On failure, error contains a description and
-        the path fields are None.
+        month: Target Patch Tuesday month as YYYY-MM or YYYY-Mon. Defaults to current month.
+        windows_version: Platform key — currently only '11-25H2' is supported.
+        compare_with_previous: If True (default), return only files whose version
+                               changed vs. the previous month.
     """
-    cve_id = cve_id.strip().upper()
-    if not validate_cve(cve_id):
-        raise ValueError(f"Invalid CVE format '{cve_id}'. Expected CVE-YYYY-NNNNN.")
+    effective_month = month or datetime.now().strftime("%Y-%b")
 
-    result: Dict[str, Any] = {
-        "cve_id": cve_id,
-        "tag": None,
-        "patch_month": None,
-        "kb_id": None,
-        "filename": filename or None,
-        "patched_path": None,
-        "vulnerable_path": None,
-        "patched_version": None,
-        "vulnerable_version": None,
-        "error": None,
-    }
-
-    tag, mapped_files, patch_month = _resolve_cve(cve_id)
-    result["tag"] = tag
-    result["patch_month"] = patch_month
-
-    if not filename:
-        if not mapped_files:
-            result["error"] = (
-                f"No COMPONENT_MAP entry for tag '{tag}'. "
-                "Re-call with filename=<binary> to specify it explicitly. "
-                "Use list_component_mappings() to browse known mappings."
+    try:
+        kb = _fetch_kb_for_platform(effective_month, windows_version)
+        if not kb:
+            return (
+                f"ERROR: No vendor-fix remediation found for "
+                f"windows_version='{windows_version}' in month '{effective_month}'."
             )
-            return result
-        if len(mapped_files) > 1:
-            result["error"] = (
-                f"Tag '{tag}' maps to multiple files: {', '.join(mapped_files)}. "
-                "Re-call with filename=<one of these>."
-            )
-            return result
-        filename = mapped_files[0]
 
-    result["filename"] = filename
-    output_dir = os.path.join(BASE_DIR, cve_id)
-    file_result = _download_pair(filename, patch_month, output_dir, windows_version)
+        current_files = _fetch_kb_file_list(kb)
+        total_in_kb = len(current_files)
 
-    result["kb_id"] = file_result["kb_id"]
-    result["patched_path"] = file_result["patched_path"]
-    result["vulnerable_path"] = file_result["vulnerable_path"]
-    result["patched_version"] = file_result["patched_version"]
-    result["vulnerable_version"] = file_result["vulnerable_version"]
-    result["error"] = file_result["error"]
-    return result
+        prev_kb = None
+        if compare_with_previous:
+            prev_month = _get_previous_month(effective_month)
+            prev_kb = _fetch_kb_for_platform(prev_month, windows_version)
+            if prev_kb:
+                prev_files = _fetch_kb_file_list(prev_kb)
+                candidates = _compare_kb_files(current_files, prev_files)
+            else:
+                candidates = current_files
+        else:
+            candidates = current_files
+
+        # Write CSV to BASE_DIR
+        os.makedirs(BASE_DIR, exist_ok=True)
+        filename = f"{effective_month}_KB{kb}_{windows_version}_updated_files.csv"
+        out_path = os.path.join(BASE_DIR, filename)
+
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["file_name", "description", "file_version", "previous_version"])
+            for entry in candidates:
+                pe_path = _resolve_pe_path(entry["file_name"])
+                desc = (_pe_file_description(pe_path) or "") if pe_path else ""
+                writer.writerow([
+                    entry["file_name"],
+                    desc,
+                    entry["file_version"],
+                    entry.get("previous_version") or "",
+                ])
+
+        prev_info = f", diff vs KB{prev_kb}" if prev_kb else ""
+        return (
+            f"Saved {len(candidates)} files (of {total_in_kb} in KB{kb}{prev_info}) "
+            f"to {out_path}"
+        )
+
+    except (RuntimeError, ValueError, PermissionError, OSError) as exc:
+        return f"ERROR: {exc}"
 
 
 @mcp.tool()
-def list_component_mappings(tag_filter: str = "") -> List[Dict[str, Any]]:
-    """List known CVE security tag → binary filename mappings.
+def list_iat(filename: str) -> Dict[str, Any]:
+    """List unique DLLs imported by a PE file and their FileDescription.
 
-    Grouped by tag so multi-file components (e.g. 'Windows Hyper-V' → 4 files)
-    appear as a single entry. Useful for checking what filename to pass when
-    download_patch_binaries reports an ambiguity, or for discovering what's
-    covered before attempting a download.
+    Parses the IAT of a PE in C:\\Windows\\System32, collects the unique set
+    of imported DLL names, then reads the FileDescription from each DLL's
+    VS_VERSIONINFO block (when the DLL is also present in System32).
 
     Args:
-        tag_filter: Optional case-insensitive substring to filter tag names.
+        filename: PE filename, e.g. 'clfs.sys', 'ntoskrnl.exe', 'lsass.exe'.
+                  No path separators allowed.
 
     Returns:
-        List of dicts: {tag_name: str, filenames: list[str]}
+        Dict with keys:
+          filepath — absolute path that was parsed
+          dlls     — list of {dll, description, found_in_system32}
+          error    — None on success, error string on failure
     """
-    groups = _grouped_component_map()
-    if tag_filter:
-        lf = tag_filter.lower()
-        groups = [g for g in groups if lf in g["tag_name"].lower()]
-    return groups
+    result: Dict[str, Any] = {"filepath": None, "dlls": [], "error": None}
+
+    if os.sep in filename or "/" in filename or "\\" in filename:
+        result["error"] = "filename must not contain path separators."
+        return result
+
+    pe_path = _resolve_pe_path(filename)
+    if pe_path is None:
+        result["filepath"] = str(SYSTEM32 / filename)
+        result["error"] = f"'{filename}' not found in {SYSTEM32} or {DRIVERS}."
+        return result
+    result["filepath"] = str(pe_path)
+
+    try:
+        pe = pefile.PE(str(pe_path), fast_load=True)
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
+        )
+    except pefile.PEFormatError as exc:
+        result["error"] = f"pefile could not parse '{filename}': {exc}"
+        return result
+    except OSError as exc:
+        result["error"] = f"Could not read '{filename}': {exc}"
+        return result
+
+    seen: set = set()
+    unique_dlls: List[str] = []
+    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+        dll_name = entry.dll.decode(errors="replace")
+        if dll_name.lower() not in seen:
+            seen.add(dll_name.lower())
+            unique_dlls.append(dll_name)
+    pe.close()
+
+    dlls = []
+    for dll_name in unique_dlls:
+        dll_path = _resolve_pe_path(dll_name)
+        found = dll_path is not None
+        description = _pe_file_description(dll_path) if found else None
+        dlls.append({
+            "dll": dll_name,
+            "description": description,
+            "found_in_system32": found,
+        })
+
+    result["dlls"] = dlls
+    return result
 
 
 def _pe_file_description(pe_path: Path) -> Optional[str]:
@@ -484,92 +599,7 @@ def _pe_file_description(pe_path: Path) -> Optional[str]:
     return None
 
 
-def _safe_filename(filename: str) -> Optional[str]:
-    """Return filename if it contains no path separators, else None."""
-    if os.sep in filename or "/" in filename or "\\" in filename:
-        return None
-    return filename
-
-
-@mcp.tool()
-def list_iat(filename: str) -> Dict[str, Any]:
-    """List unique DLLs imported by a PE file and their FileDescription.
-
-    Parses the IAT of a PE in C:\\Windows\\System32, collects the unique set
-    of imported DLL names, then reads the FileDescription from each DLL's
-    VS_VERSIONINFO block (when the DLL is also present in System32).
-
-    Use the descriptions to quickly filter which dependencies are relevant
-    to the component you are investigating (e.g. skip generic runtime DLLs,
-    focus on subsystem-specific ones).
-
-    Lookup is restricted to C:\\Windows\\System32 and C:\\Windows\\System32\\drivers
-    — no path separators allowed in filename.
-
-    Args:
-        filename: PE filename, e.g. 'clfs.sys', 'ntoskrnl.exe', 'lsass.exe'.
-
-    Returns:
-        Dict with keys:
-          filepath — absolute path that was parsed
-          dlls     — list of {dll, description, found_in_system32}
-                     description is None when the DLL is not in System32 or
-                     has no FileDescription (e.g. api-ms-win-* forwarder stubs)
-          error    — None on success, error string on failure
-    """
-    result: Dict[str, Any] = {"filepath": None, "dlls": [], "error": None}
-
-    if not _safe_filename(filename):
-        result["error"] = "filename must not contain path separators."
-        return result
-
-    pe_path = _resolve_pe_path(filename)
-    if pe_path is None:
-        result["filepath"] = str(SYSTEM32 / filename)
-        result["error"] = f"'{filename}' not found in {SYSTEM32} or {DRIVERS}."
-        return result
-    result["filepath"] = str(pe_path)
-
-    # Parse import directory of the target PE
-    try:
-        pe = pefile.PE(str(pe_path), fast_load=True)
-        pe.parse_data_directories(
-            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
-        )
-    except pefile.PEFormatError as exc:
-        result["error"] = f"pefile could not parse '{filename}': {exc}"
-        return result
-    except OSError as exc:
-        result["error"] = f"Could not read '{filename}': {exc}"
-        return result
-
-    # Collect unique DLL names (preserve IAT order, deduplicate)
-    seen: set = set()
-    unique_dlls: List[str] = []
-    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
-        dll_name = entry.dll.decode(errors="replace")
-        if dll_name.lower() not in seen:
-            seen.add(dll_name.lower())
-            unique_dlls.append(dll_name)
-    pe.close()
-
-    # Resolve FileDescription for each unique DLL (System32, then drivers\)
-    dlls = []
-    for dll_name in unique_dlls:
-        dll_path = _resolve_pe_path(dll_name)
-        found = dll_path is not None
-        description = _pe_file_description(dll_path) if found else None
-        dlls.append({
-            "dll": dll_name,
-            "description": description,
-            "found_in_system32": found,
-        })
-
-    result["dlls"] = dlls
-    return result
-
-
-# ── PE Index tools ───────────────────────────────────────────────────────────
+# ── PE Index tools ────────────────────────────────────────────────────────────
 
 
 def _pe_index_available() -> bool:
@@ -601,14 +631,11 @@ def _extract_description(doc_text: str) -> Optional[str]:
 def search_pe_by_description(keyword: str, top_k: int = 10) -> Dict[str, Any]:
     """Search Windows PE files (DLL/EXE/SYS) by their FileDescription.
 
-    Resolves an MSRC vulnerability title or subsystem name to the actual binary.
+    Resolves a subsystem name or vulnerability title to the actual binary.
     For example: 'mailslot' → msfs.sys, 'telephony' → tapisrv.dll.
 
-    Searches a pre-built index of ~4700 PE files from System32 and drivers.
-
     Args:
-        keyword: Subsystem or description keywords from the CVE title.
-                 Use the feature name, NOT the CVE ID.
+        keyword: Subsystem or description keywords.
         top_k: Number of results (default 10, max 20).
     """
     result: Dict[str, Any] = {"results": [], "count": 0, "error": None}
@@ -655,9 +682,6 @@ def search_pe_by_description(keyword: str, top_k: int = 10) -> Dict[str, Any]:
 @mcp.tool()
 def search_pe_by_name(filename: str) -> Dict[str, Any]:
     """Look up a PE file by exact filename to get its description and metadata.
-
-    Use when you have a filename and want to confirm what component it is
-    (e.g. that profsvc.dll is 'User Profile Service').
 
     Args:
         filename: Exact PE filename, e.g. 'msfs.sys', 'profsvc.dll'.
