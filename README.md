@@ -1,11 +1,11 @@
-# AI Assistance in Windows nternals reverse engineering and patch diffing toolkit
+# AI Assistance in Windows Internals reverse engineering and patch diffing toolkit
 ---
 
 ## Overview
 
 This project consists of three main components:
 
-1. **Patch Diffing Workflow** — Automated tools for triaging CVEs from Microsoft Patch Tuesday, fetching pre/post-patch binaries, and using Ghidra + BinDiff to analyze binary differences.
+1. **Patch Diffing Workflow** — Automated tools for triaging CVEs from Microsoft Patch Tuesday, identifying updated binaries via KB file manifests, and using Ghidra + BinDiff to analyze binary differences.
 
 2. **Windows Internals RAG** — A local RAG system providing build-accurate access to Windows kernel struct layouts, native API documentation, and WDK references via MCP servers.
 
@@ -20,9 +20,10 @@ This project consists of three main components:
 | Tool | Purpose |
 |------|--------|
 | `mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py` | Fetches high-exploitability CVEs from Microsoft MSRC CVRF API |
-| `mcp_server/patch_tuesday_triage_analysis/fetch_cve_related_pre_post_patch_binaries.py` | Downloads patched and vulnerable Windows binaries for a given CVE |
 | `bindiff_high_roi_to_csv.py` | Runs BinDiff headlessly and exports changed functions to CSV |
-| `mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py` | MCP server exposing the full triage workflow + PE index search as tools |
+| `mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py` | MCP server exposing CVE triage, KB file discovery, IAT analysis, and PE index search |
+
+> **Note:** Binary discovery is now KB-CSV-based (see workflow below). The previous WinBIndex/COMPONENT_MAP approach (`fetch_cve_related_pre_post_patch_binaries.py`) has been removed.
 
 ### Ghidra Scripts
 
@@ -89,7 +90,11 @@ Indexes all PE files (~4700) from a standard Windows workstation:
 
 1. Clone the repository and navigate to the directory
 2. Ensure Ghidra is installed and BinExport/BinDiff extensions are active
-3. (Optional) Configure MCP client for patch triage tools:
+3. Install MCP server dependencies:
+   ```bash
+   pip install requests beautifulsoup4 pefile chromadb openai mcp
+   ```
+4. (Optional) Configure MCP client for patch triage tools:
 
 ```json
 {
@@ -145,27 +150,37 @@ Indexes all PE files (~4700) from a standard Windows workstation:
 
 ### Patch Diffing Workflow
 
-1. **Triage CVEs:**
-   ```bash
-   python mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py --month 2025-04
-   ```
+The workflow is KB-driven: instead of resolving binaries from individual CVE tags, it fetches Microsoft's official file-version manifest for the month's cumulative update and diffs it against the previous month to find files that actually changed version.
 
-2. **Fetch binaries for a CVE:**
-   ```bash
-   python mcp_server/patch_tuesday_triage_analysis/fetch_cve_related_pre_post_patch_binaries.py --cve CVE-2025-29824
-   ```
+**Supported platform:** Windows 11 25H2 x64 only.
 
-3. **Analyze with Ghidra:**
-   - Open each binary in Ghidra
+1. **Triage CVEs** (via MCP tool or standalone script):
+   ```bash
+   python mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py --month 2026-03
+   ```
+   Returns high-exploitability CVEs (`Exploitation Detected` / `Exploitation More Likely`) with severity, CVSS score, and the KB number that patches them on 25H2.
+
+2. **Discover updated binaries for the month** (via MCP tool `fetch_kb_updated_files`):
+   - Resolves the cumulative update KB from MSRC CVRF
+   - Downloads the file-version CSV from `support.microsoft.com/help/{KB}`
+   - Filters for x64 `.exe`/`.dll`/`.sys` files
+   - Diffs against the previous month's KB to find version-changed files only
+   - Enriches each entry with `FileDescription` from the local PE on disk
+   - Saves a CSV to `BASE_DIR/{month}_KB{kb}_11-25H2_updated_files.csv`
+
+3. **Cross-reference CVEs with updated binaries** — use the CVE list from step 1 and the file list from step 2 to identify which changed binaries are associated with high-exploitability vulnerabilities.
+
+4. **Analyze with Ghidra:**
+   - Open pre/post-patch binaries in Ghidra
    - Run `full_script_suite.py` from the Script Manager (Window → Script Manager)
    - This executes: C++ class extraction → datatype merging → binexport generation
 
-4. **Generate diff report:**
+5. **Generate diff report:**
    ```bash
    python bindiff_high_roi_to_csv.py primary.BinExport secondary.BinExport
    ```
 
-5. **Visual inspection:** Open the `.BinDiff` file in BinDiff GUI for detailed analysis
+6. **Visual inspection:** Open the `.BinDiff` file in BinDiff GUI for detailed analysis
 
 ### Windows Internals RAG Usage
 
@@ -204,12 +219,32 @@ search_pe_by_name("tapisrv.dll")  # Returns metadata for Telephony Service DLL
 
 | Tool | Arguments | Returns |
 |------|-----------|--------|
-| `fetch_patch_tuesday_cves` | `month`, `api_token` (optional) | List of high-exploitability CVEs with severity, CVSS, exploitability |
-| `download_patch_binaries` | `cve_id`, `filename` (optional), `windows_version` | Paths to patched and vulnerable binaries, version info |
-| `list_component_mappings` | `tag_filter` (optional substring) | Known CVE tag → binary filename mappings |
-| `list_iat` | `filename` (PE filename, no path) | IAT of a PE from System32/drivers with DLL descriptions |
-| `search_pe_by_description` | `keyword`, `top_k` (default 10) | PE files matching description keywords |
+| `fetch_patch_tuesday_cves` | `month` (YYYY-MM or YYYY-Mon, default: current) | List of high-exploitability CVEs with severity, CVSS, exploitability, and KB number for 25H2 |
+| `fetch_kb_updated_files` | `month`, `windows_version` (default: `11-25H2`), `compare_with_previous` (default: `True`) | Saves CSV to `BASE_DIR`; returns summary string with path and counts |
+| `list_iat` | `filename` (PE filename, no path separators) | IAT of a PE from System32/drivers with DLL FileDescriptions |
+| `search_pe_by_description` | `keyword`, `top_k` (default 10, max 20) | PE files semantically matching description keywords |
 | `search_pe_by_name` | `filename` | Metadata for exact filename match |
+
+#### `fetch_patch_tuesday_cves` output fields
+
+| Field | Description |
+|-------|-------------|
+| `CVE_ID` | CVE identifier |
+| `Title` | Vulnerability title |
+| `Severity` | Critical / Important |
+| `Exploitability` | Exploitation Detected / Exploitation More Likely |
+| `CVSS_BaseScore` | CVSS 3.1 base score |
+| `CVSS_Vector` | Full CVSS vector string |
+| `KB` | KB number patching this CVE on Windows 11 25H2 x64, or `null` if not applicable |
+
+#### `fetch_kb_updated_files` CSV columns
+
+| Column | Description |
+|--------|-------------|
+| `file_name` | Binary filename (e.g. `srv2.sys`) |
+| `description` | FileDescription from PE version info on local disk, or empty |
+| `file_version` | Version in this month's KB |
+| `previous_version` | Version in previous month's KB (empty if file is new) |
 
 ### Windows Internals MCP Server (`winternals`)
 
@@ -229,7 +264,7 @@ search_pe_by_name("tapisrv.dll")  # Returns metadata for Telephony Service DLL
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BASE_DIR` | `./patch_bins` | Directory for downloaded binaries |
+| `BASE_DIR` | `./patch_bins` | Output directory for KB updated-files CSVs |
 | `PE_INDEX_DB` | *(not set)* | Path to PE index ChromaDB (enables `search_pe_*` tools) |
 | `PE_INDEX_COLLECTION` | `pe_files` | ChromaDB collection name for PE index |
 | `PE_INDEX_EMBED_URL` | `http://localhost:1234/v1` | LM Studio embedding endpoint |
@@ -276,8 +311,7 @@ patchDiffingNotes/
 ├── README_2.md                                  # Original RAG readme
 ├── mcp_server/                                  # MCP servers
 │   ├── patch_tuesday_triage_analysis/           # Patch Tuesday triage server
-│   │   ├── fetch_cve_related_pre_post_patch_binaries.py
-│   │   ├── fetch_patch_tuesday_interesting_vulns.py
+│   │   ├── fetch_patch_tuesday_interesting_vulns.py  # CVE triage helpers
 │   │   └── patch_tuesday_triage_analysis_mcp_server.py
 │   └── winternals_rag/                          # Windows Internals RAG server
 │       └── winternals_rag_mcp.py
