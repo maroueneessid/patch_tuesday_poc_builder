@@ -7,7 +7,7 @@ as tools for any MCP-compatible client (Claude Desktop, LM Studio, etc.)
 
 Configuration via environment variables:
     WINTERNALS_DB        — path to ChromaDB database (required)
-    WINTERNALS_EMBED_URL — LM Studio embedding endpoint (default: http://localhost:1234/v1)
+    WINTERNALS_EMBED_URL — LM Studio embedding endpoint (default: http://0.0.0.0:1234/v1)
     WINTERNALS_EMBED_MODEL — embedding model name (default: text-embedding-nomic-embed-text-v1.5@f32)
 
 Requirements:
@@ -39,6 +39,7 @@ LM Studio MCP config (add to your MCP settings):
 import os
 import sys
 import re
+import argparse
 
 from mcp.server.fastmcp import FastMCP
 import chromadb
@@ -48,18 +49,11 @@ from openai import OpenAI
 # Config from environment
 # =============================================================================
 
-DB_PATH = os.environ.get("WINTERNALS_DB", "")
-EMBED_URL = os.environ.get("WINTERNALS_EMBED_URL", "http://localhost:1234/v1")
+
+EMBED_URL = os.environ.get("WINTERNALS_EMBED_URL", "http://0.0.0.0:1234/v1")
 EMBED_MODEL = os.environ.get("WINTERNALS_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5@f32")
 COLLECTION_NAME = "winternals"
 
-if not DB_PATH:
-    print("ERROR: WINTERNALS_DB environment variable not set.", file=sys.stderr)
-    print("Set it to the path of your ChromaDB database.", file=sys.stderr)
-    print("Example: export WINTERNALS_DB=~/.winternals_rag/chromadb", file=sys.stderr)
-    sys.exit(1)
-
-DB_PATH = os.path.expanduser(DB_PATH)
 
 # =============================================================================
 # Initialize
@@ -490,5 +484,22 @@ def get_stats() -> str:
 # Run
 # =============================================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run the Winternals MCP tool."
+    )
+    parser.add_argument(
+        "--db",
+        dest="db_path",
+        required=True,
+        help="Path to the Winternals ChromaDB file (e.g. /path/to/winternals.chromadb)",
+    )
+    # add any other options you need here
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    global DB_PATH
+    DB_PATH = os.path.expanduser(args.db_path)
     mcp.run()

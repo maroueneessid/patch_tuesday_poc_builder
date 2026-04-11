@@ -23,6 +23,7 @@ import gzip
 import io
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime
@@ -73,6 +74,12 @@ WINDOWS_VERSION_PRODUCT_IDS: Dict[str, List[str]] = {
 DEFAULT_WINDOWS_VERSION = "11-25H2"
 
 _EXECUTABLE_EXTENSIONS = {".exe", ".dll", ".sys"}
+
+# ── WinBIndex / Symbol Server constants ──────────────────────────────────────
+
+WINBINDEX_URL     = "https://winbindex.m417z.com/data/by_filename_compressed"
+SYMBOL_SERVER_URL = "https://msdl.microsoft.com/download/symbols"
+WINBINDEX_DEFAULT_WINDOWS_VERSION = "11-24H2"
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
 
@@ -387,6 +394,153 @@ def _compare_kb_files(
     return changed
 
 
+# ── WinBIndex / Symbol Server helpers ────────────────────────────────────────
+
+
+def _get_patch_tuesday(year: int, month: int) -> datetime:
+    """Return the second Tuesday of the given month."""
+    first_day = datetime(year, month, 1)
+    days_to_tuesday = (1 - first_day.weekday()) % 7
+    if days_to_tuesday == 0 and first_day.weekday() != 1:
+        days_to_tuesday = 7
+    return datetime(year, month, 1 + days_to_tuesday + 7)
+
+
+def _is_near_patch_tuesday(date_str: str, target_month: str, tolerance: int = 2) -> bool:
+    """Check if date_str (YYYY-MM-DD) falls within ±tolerance days of Patch Tuesday."""
+    try:
+        date = datetime.strptime(date_str, "%Y-%m-%d")
+        y, m = map(int, target_month.split("-"))
+        if date.year != y or date.month != m:
+            return False
+        pt = _get_patch_tuesday(y, m)
+        return abs((date - pt).days) <= tolerance
+    except (ValueError, TypeError):
+        return False
+
+
+def _extract_winbindex_entry(
+    entry: Dict, sha256: str, kb_id: str, kb_data: Dict, source_label: str
+) -> Optional[Dict]:
+    """Build a version-entry dict from a WinBIndex record, or None if fields are missing."""
+    file_info = entry.get("fileInfo", {})
+    timestamp = file_info.get("timestamp")
+    virtual_size = file_info.get("virtualSize")
+    update_info = kb_data.get("updateInfo", {})
+    release_date = update_info.get("releaseDate")
+
+    assemblies = kb_data.get("assemblies", {})
+    if assemblies:
+        first = next(iter(assemblies.values()))
+        release_version = first.get("assemblyIdentity", {}).get("version", "")
+    else:
+        release_version = update_info.get("releaseVersion", "")
+
+    if not all([timestamp, virtual_size, release_date, release_version]):
+        return None
+
+    return {
+        "timestamp": timestamp,
+        "virtual_size": virtual_size,
+        "sha256": sha256,
+        "release_date": release_date,
+        "kb_id": kb_id,
+        "release_version": release_version,
+        "source": source_label,
+    }
+
+
+def _select_patch_versions(
+    db_path: str, windows_version: str, patch_month: str
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Parse a WinBIndex .json.gz and return (patched, vulnerable) version dicts.
+
+    The patched version comes from the patch month's Patch Tuesday window;
+    the vulnerable version comes from the previous month.
+    """
+    with gzip.open(db_path, "rt", encoding="utf-8") as f:
+        data = json.load(f)
+
+    target_year, target_month_num = map(int, patch_month.split("-"))
+    if target_month_num == 1:
+        prev_year, prev_month_num = target_year - 1, 12
+    else:
+        prev_year, prev_month_num = target_year, target_month_num - 1
+    prev_month_str = f"{prev_year:04d}-{prev_month_num:02d}"
+    prev_pt = _get_patch_tuesday(prev_year, prev_month_num)
+
+    patch_versions: Dict[str, Dict] = {}
+    vuln_pt: Dict[str, Dict] = {}
+    vuln_after_pt: Dict[str, Dict] = {}
+    vuln_all: Dict[str, Dict] = {}
+
+    def _process(ve: Dict) -> None:
+        rd = ve["release_date"]
+        rv = ve["release_version"]
+        if _is_near_patch_tuesday(rd, patch_month):
+            if rv not in patch_versions or rd > patch_versions[rv]["release_date"]:
+                patch_versions[rv] = ve
+        elif rd.startswith(prev_month_str):
+            if rv not in vuln_all or rd > vuln_all[rv]["release_date"]:
+                vuln_all[rv] = ve
+            try:
+                rd_dt = datetime.strptime(rd, "%Y-%m-%d")
+                if _is_near_patch_tuesday(rd, prev_month_str):
+                    if rv not in vuln_pt or rd > vuln_pt[rv]["release_date"]:
+                        vuln_pt[rv] = ve
+                elif rd_dt >= prev_pt:
+                    if rv not in vuln_after_pt or rd > vuln_after_pt[rv]["release_date"]:
+                        vuln_after_pt[rv] = ve
+            except ValueError:
+                pass
+
+    for sha256, entry in data.items():
+        fi = entry.get("fileInfo", {})
+        if not fi.get("timestamp") or not fi.get("virtualSize"):
+            continue
+        win_vers = entry.get("windowsVersions", {})
+        if windows_version in win_vers:
+            for kb_id, kb_data in win_vers[windows_version].items():
+                ve = _extract_winbindex_entry(entry, sha256, kb_id, kb_data,
+                                              f"direct ({windows_version})")
+                if ve:
+                    _process(ve)
+        for cur_ver, ver_data in win_vers.items():
+            if cur_ver == windows_version:
+                continue
+            for kb_id, kb_data in ver_data.items():
+                other = kb_data.get("updateInfo", {}).get("otherWindowsVersions", [])
+                if windows_version in other:
+                    ve = _extract_winbindex_entry(entry, sha256, kb_id, kb_data,
+                                                  f"fallback ({cur_ver}->{windows_version})")
+                    if ve:
+                        _process(ve)
+
+    def _pick_best(d: Dict[str, Dict]) -> Optional[Dict]:
+        if not d:
+            return None
+        by_date = sorted(d.values(), key=lambda v: v["release_date"], reverse=True)
+        direct = [v for v in by_date if v["source"].startswith("direct")]
+        return direct[0] if direct else by_date[0]
+
+    patched = _pick_best(patch_versions)
+    vulnerable = _pick_best(vuln_pt) or _pick_best(vuln_after_pt) or _pick_best(vuln_all)
+    return patched, vulnerable
+
+
+def _download_symbol(version_info: Dict, filename: str, dest_dir: str) -> str:
+    """Download a PE binary from the Microsoft Symbol Server. Returns the local path."""
+    ts_hex = f"{version_info['timestamp']:08X}"
+    sz_hex = f"{version_info['virtual_size']:X}"
+    url = f"{SYMBOL_SERVER_URL}/{filename}/{ts_hex}{sz_hex}/{filename}"
+    stem = Path(filename).stem
+    ext  = Path(filename).suffix
+    local_name = f"{stem}_{version_info['release_version']}{ext}"
+    local_path = os.path.join(dest_dir, local_name)
+    _stream_to_file(url, local_path, timeout=120)
+    return local_path
+
+
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 
@@ -505,6 +659,70 @@ def fetch_kb_updated_files(
 
     except (RuntimeError, ValueError, PermissionError, OSError) as exc:
         return f"ERROR: {exc}"
+
+
+@mcp.tool()
+def download_patch_binaries(
+    filename: str,
+    patch_month: str,
+    windows_version: str = WINBINDEX_DEFAULT_WINDOWS_VERSION,
+) -> Dict[str, Any]:
+    """Download the patched and vulnerable versions of a Windows binary from the
+    Microsoft Symbol Server, identified via WinBIndex.
+
+    Args:
+        filename:        Binary filename, e.g. 'clfs.sys', 'ntoskrnl.exe'.
+        patch_month:     Month the patch landed, YYYY-MM (e.g. '2025-04').
+        windows_version: WinBIndex version key (default '11-24H2').
+
+    Returns:
+        Dict with keys: patched_path, vulnerable_path, patched_version,
+        vulnerable_version, error (None on success).
+    """
+    result: Dict[str, Any] = {
+        "patched_path": None,
+        "vulnerable_path": None,
+        "patched_version": None,
+        "vulnerable_version": None,
+        "error": None,
+    }
+
+    if not re.match(r"^\d{4}-\d{2}$", patch_month):
+        result["error"] = "Invalid patch_month format. Expected YYYY-MM (e.g. '2025-04')."
+        return result
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        # Download WinBIndex database
+        db_url = f"{WINBINDEX_URL}/{filename}.json.gz"
+        db_path = os.path.join(tmp_dir, f"{Path(filename).stem}.json.gz")
+        _stream_to_file(db_url, db_path, timeout=60)
+
+        patched, vulnerable = _select_patch_versions(db_path, windows_version, patch_month)
+
+        if not patched:
+            result["error"] = f"No patched version found for {filename} in {patch_month} ({windows_version})."
+            return result
+        if not vulnerable:
+            result["error"] = f"No vulnerable version found for {filename} before {patch_month} ({windows_version})."
+            return result
+
+        os.makedirs(BASE_DIR, exist_ok=True)
+        result["patched_path"]    = _download_symbol(patched,    filename, BASE_DIR)
+        result["vulnerable_path"] = _download_symbol(vulnerable, filename, BASE_DIR)
+        result["patched_version"]    = patched["release_version"]
+        result["vulnerable_version"] = vulnerable["release_version"]
+
+    except Exception as exc:
+        result["error"] = str(exc)
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return result
 
 
 @mcp.tool()
