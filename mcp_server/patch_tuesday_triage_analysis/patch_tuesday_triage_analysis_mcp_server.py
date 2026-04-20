@@ -9,13 +9,10 @@ files that actually changed version (not just repackaged).
 
 Configuration (all env vars):
     BASE_DIR             — directory for downloaded binaries (default: ./patch_bins)
-    PE_INDEX_DB          — path to pe-index ChromaDB (optional, enables search_pe_* tools)
-    PE_INDEX_COLLECTION  — ChromaDB collection name (default: pe_files)
-    PE_INDEX_EMBED_URL   — embedding endpoint (default: http://localhost:1234/v1)
-    PE_INDEX_EMBED_MODEL — embedding model (default: text-embedding-nomic-embed-text-v1.5@f32)
+
 
 Usage:
-    BASE_DIR=./research PE_INDEX_DB=./pe-index.chromadb python patch_tuesday_mcp_server.py
+    BASE_DIR=./research python patch_tuesday_mcp_server.py
 """
 
 import csv
@@ -30,30 +27,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import chromadb
 import pefile
 import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
 from mcp.server.fastmcp import FastMCP
 
 SYSTEM32 = Path(r"C:\Windows\System32")
-DRIVERS  = SYSTEM32 / "drivers"
+DRIVERS = SYSTEM32 / "drivers"
 
-# ── PE Index config ──────────────────────────────────────────────────────────
-
-PE_INDEX_DB          = os.environ.get("PE_INDEX_DB", "")
-PE_INDEX_COLLECTION  = os.environ.get("PE_INDEX_COLLECTION", "pe_files")
-PE_INDEX_EMBED_URL   = os.environ.get("PE_INDEX_EMBED_URL", "http://localhost:1234/v1")
-PE_INDEX_EMBED_MODEL = os.environ.get(
-    "PE_INDEX_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5@f32"
-)
 
 # ── Import CVE helpers ────────────────────────────────────────────────────────
 
 from fetch_patch_tuesday_interesting_vulns import (
-    get_severity,
     get_cvss_info,
+    get_severity,
 )
 
 # ── Server setup ──────────────────────────────────────────────────────────────
@@ -77,14 +64,16 @@ _EXECUTABLE_EXTENSIONS = {".exe", ".dll", ".sys"}
 
 # ── WinBIndex / Symbol Server constants ──────────────────────────────────────
 
-WINBINDEX_URL     = "https://winbindex.m417z.com/data/by_filename_compressed"
+WINBINDEX_URL = "https://winbindex.m417z.com/data/by_filename_compressed"
 SYMBOL_SERVER_URL = "https://msdl.microsoft.com/download/symbols"
 WINBINDEX_DEFAULT_WINDOWS_VERSION = "11-24H2"
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
 
 
-def _http_get(url: str, stream: bool = False, timeout: int = 60, **kwargs) -> requests.Response:
+def _http_get(
+    url: str, stream: bool = False, timeout: int = 60, **kwargs
+) -> requests.Response:
     """GET with up to 3 attempts, exponential backoff.
 
     Retries on network errors and HTTP 5xx only. HTTP 4xx is returned
@@ -100,7 +89,7 @@ def _http_get(url: str, stream: bool = False, timeout: int = 60, **kwargs) -> re
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
         if attempt < 2:
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
     raise RuntimeError(f"Request to {url} failed after 3 attempts: {last_exc}")
 
 
@@ -228,9 +217,13 @@ def _fetch_kb_for_platform(month: str, windows_version: str) -> Optional[str]:
     dt = _parse_month(month)
     slug = f"{dt.year}-{dt.strftime('%b')}"
 
-    r = _http_get(f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30)
+    r = _http_get(
+        f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'.")
+        raise RuntimeError(
+            f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'."
+        )
 
     for vuln in r.json().get("Vulnerability", []):
         kb = _extract_kb_for_vuln(vuln, target_ids)
@@ -269,7 +262,9 @@ def _fetch_kb_file_list(kb_number: str, arch: str = "x64") -> List[Dict[str, str
 
     soup = BeautifulSoup(r.text, "html.parser")
     csv_url: Optional[str] = None
-    target_text = f"download the file information for cumulative update {kb_number.lower()}"
+    target_text = (
+        f"download the file information for cumulative update {kb_number.lower()}"
+    )
 
     # Primary: exact anchor text match
     for a in soup.find_all("a", class_="ocpExternalLink"):
@@ -281,7 +276,10 @@ def _fetch_kb_file_list(kb_number: str, arch: str = "x64") -> List[Dict[str, str
     if not csv_url:
         for a in soup.find_all("a", class_="ocpExternalLink"):
             href = a.get("href", "")
-            if "go.microsoft.com/fwlink" in href and "file information" in a.get_text(strip=True).lower():
+            if (
+                "go.microsoft.com/fwlink" in href
+                and "file information" in a.get_text(strip=True).lower()
+            ):
                 csv_url = href.strip()
                 break
 
@@ -293,9 +291,7 @@ def _fetch_kb_file_list(kb_number: str, arch: str = "x64") -> List[Dict[str, str
 
     r2 = _http_get(csv_url, timeout=60)
     if r2.status_code != 200:
-        raise RuntimeError(
-            f"CSV download failed HTTP {r2.status_code} from {csv_url}"
-        )
+        raise RuntimeError(f"CSV download failed HTTP {r2.status_code} from {csv_url}")
 
     content = r2.content.decode("utf-8-sig")
 
@@ -335,13 +331,15 @@ def _fetch_kb_file_list(kb_number: str, arch: str = "x64") -> List[Dict[str, str
         ext = os.path.splitext(basename)[1].lower()
         if ext not in _EXECUTABLE_EXTENSIONS:
             continue
-        rows.append({
-            "file_name": basename,
-            "file_version": entry.get("File version", ""),
-            "file_size": entry.get("File size", ""),
-            "date": entry.get("Date", ""),
-            "time": entry.get("Time", ""),
-        })
+        rows.append(
+            {
+                "file_name": basename,
+                "file_version": entry.get("File version", ""),
+                "file_size": entry.get("File size", ""),
+                "date": entry.get("Date", ""),
+                "time": entry.get("Time", ""),
+            }
+        )
     return rows
 
 
@@ -406,7 +404,9 @@ def _get_patch_tuesday(year: int, month: int) -> datetime:
     return datetime(year, month, 1 + days_to_tuesday + 7)
 
 
-def _is_near_patch_tuesday(date_str: str, target_month: str, tolerance: int = 2) -> bool:
+def _is_near_patch_tuesday(
+    date_str: str, target_month: str, tolerance: int = 2
+) -> bool:
     """Check if date_str (YYYY-MM-DD) falls within ±tolerance days of Patch Tuesday."""
     try:
         date = datetime.strptime(date_str, "%Y-%m-%d")
@@ -489,7 +489,10 @@ def _select_patch_versions(
                     if rv not in vuln_pt or rd > vuln_pt[rv]["release_date"]:
                         vuln_pt[rv] = ve
                 elif rd_dt >= prev_pt:
-                    if rv not in vuln_after_pt or rd > vuln_after_pt[rv]["release_date"]:
+                    if (
+                        rv not in vuln_after_pt
+                        or rd > vuln_after_pt[rv]["release_date"]
+                    ):
                         vuln_after_pt[rv] = ve
             except ValueError:
                 pass
@@ -501,8 +504,9 @@ def _select_patch_versions(
         win_vers = entry.get("windowsVersions", {})
         if windows_version in win_vers:
             for kb_id, kb_data in win_vers[windows_version].items():
-                ve = _extract_winbindex_entry(entry, sha256, kb_id, kb_data,
-                                              f"direct ({windows_version})")
+                ve = _extract_winbindex_entry(
+                    entry, sha256, kb_id, kb_data, f"direct ({windows_version})"
+                )
                 if ve:
                     _process(ve)
         for cur_ver, ver_data in win_vers.items():
@@ -511,8 +515,13 @@ def _select_patch_versions(
             for kb_id, kb_data in ver_data.items():
                 other = kb_data.get("updateInfo", {}).get("otherWindowsVersions", [])
                 if windows_version in other:
-                    ve = _extract_winbindex_entry(entry, sha256, kb_id, kb_data,
-                                                  f"fallback ({cur_ver}->{windows_version})")
+                    ve = _extract_winbindex_entry(
+                        entry,
+                        sha256,
+                        kb_id,
+                        kb_data,
+                        f"fallback ({cur_ver}->{windows_version})",
+                    )
                     if ve:
                         _process(ve)
 
@@ -524,21 +533,194 @@ def _select_patch_versions(
         return direct[0] if direct else by_date[0]
 
     patched = _pick_best(patch_versions)
-    vulnerable = _pick_best(vuln_pt) or _pick_best(vuln_after_pt) or _pick_best(vuln_all)
+    vulnerable = (
+        _pick_best(vuln_pt) or _pick_best(vuln_after_pt) or _pick_best(vuln_all)
+    )
     return patched, vulnerable
 
 
-def _download_symbol(version_info: Dict, filename: str, dest_dir: str) -> str:
-    """Download a PE binary from the Microsoft Symbol Server. Returns the local path."""
+def _get_pdb_info(pe_path: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Extract PDB name and signature from PE debug directory.
+
+    Returns tuple of (pdb_info_dict, error_message).
+    pdb_info_dict contains pdb_name and signature, or None if not found.
+    error_message contains details if parsing failed.
+    """
+    try:
+        pe = pefile.PE(pe_path, fast_load=True)
+
+        # Check if debug directory exists
+        if not hasattr(pe, "OPTIONAL_HEADER"):
+            return None, "PE has no OPTIONAL_HEADER"
+
+        # Get debug directory RVA and size
+        debug_rva = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+            pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]
+        ].VirtualAddress
+        debug_size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+            pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]
+        ].Size
+
+        if debug_rva == 0 or debug_size == 0:
+            return None, "PE has no debug directory"
+
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]]
+        )
+
+        debug_entries = getattr(pe, "DIRECTORY_ENTRY_DEBUG", [])
+        if not debug_entries:
+            return None, "No debug entries found after parsing"
+
+        for entry in debug_entries:
+            if entry.struct.Type == 2:  # IMAGE_DEBUG_TYPE_CODEVIEW
+                debug_offset = entry.struct.PointerToRawData
+                debug_size = entry.struct.SizeOfData
+
+                if debug_offset == 0 or debug_size == 0:
+                    continue
+
+                # Read the debug data
+                debug_data = pe.get_data(debug_offset, debug_size)
+
+                if len(debug_data) < 4:
+                    continue
+
+                # Check for RSDS signature (GUID + age format, used by modern MS compilers)
+                if debug_data[:4] == b"RSDS":
+                    if len(debug_data) < 24:
+                        return None, f"RSDS entry too small: {len(debug_data)} bytes"
+
+                    import uuid
+
+                    # GUID is bytes 4-20 (16 bytes), age is bytes 20-24 (4 bytes)
+                    guid = uuid.UUID(bytes_le=debug_data[4:20])
+                    age = int.from_bytes(debug_data[20:24], "little")
+                    # PDB path follows as null-terminated string
+                    pdb_path_bytes = debug_data[24:].split(b"\x00")[0]
+                    pdb_path = pdb_path_bytes.decode("utf-8", errors="ignore")
+
+                    if not pdb_path:
+                        return None, "RSDS entry has empty PDB path"
+
+                    pdb_name = os.path.basename(pdb_path)
+
+                    # Signature format for symbol server: GUID (no dashes) + age (hex, uppercase)
+                    guid_hex = guid.hex.upper()
+                    signature = f"{guid_hex}{age:X}"
+
+                    return {
+                        "pdb_name": pdb_name,
+                        "signature": signature,
+                    }, None
+
+                # Check for NB10 signature (older format: timestamp + size/age)
+                elif debug_data[:4] == b"NB10":
+                    if len(debug_data) < 12:
+                        return None, f"NB10 entry too small: {len(debug_data)} bytes"
+
+                    # timestamp at offset 4, age at offset 8
+                    timestamp = int.from_bytes(debug_data[4:8], "little")
+                    age = int.from_bytes(debug_data[8:12], "little")
+                    pdb_path_bytes = debug_data[12:].split(b"\x00")[0]
+                    pdb_path = pdb_path_bytes.decode("utf-8", errors="ignore")
+
+                    if not pdb_path:
+                        return None, "NB10 entry has empty PDB path"
+
+                    pdb_name = os.path.basename(pdb_path)
+
+                    # Signature format: timestamp (8 hex digits, uppercase) + age (hex)
+                    signature = f"{timestamp:08X}{age:X}"
+
+                    return {
+                        "pdb_name": pdb_name,
+                        "signature": signature,
+                    }, None
+
+        return (
+            None,
+            f"No CodeView (RSDS/NB10) debug entry found among {len(debug_entries)} entries",
+        )
+    except Exception as e:
+        import traceback
+
+        return (
+            None,
+            f"Exception parsing PE: {type(e).__name__}: {e}\n{traceback.format_exc()}",
+        )
+
+
+def _download_pdb(
+    pdb_info: Optional[Dict[str, str]], dest_dir: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Download a PDB from the Microsoft Symbol Server.
+
+    Args:
+        pdb_info: Dict with pdb_name and signature from _get_pdb_info
+        dest_dir: Directory to save the PDB
+
+    Returns:
+        Tuple of (local_path, error_message) - error_message is None on success
+    """
+    if pdb_info is None:
+        return None, "No PDB info provided"
+    pdb_name = pdb_info["pdb_name"]
+    signature = pdb_info["signature"]
+
+    # Microsoft Symbol Server URL format for PDBs
+    url = f"{SYMBOL_SERVER_URL}/{pdb_name}/{signature}/{pdb_name}"
+
+    local_path = os.path.join(dest_dir, pdb_name)
+
+    try:
+        _stream_to_file(
+            url, local_path, timeout=180
+        )  # PDBs can be large, longer timeout
+        return local_path, None
+    except Exception as e:
+        return None, f"Failed to download {url}: {e}"
+
+
+def _download_symbol(
+    version_info: Dict, filename: str, dest_dir: str
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Download a PE binary and its PDB from the Microsoft Symbol Server.
+
+    Returns:
+        Tuple of (binary_local_path, pdb_local_path, error_message)
+        pdb_local_path may be None if PDB not found or download failed.
+        error_message contains details if PDB download failed.
+    """
     ts_hex = f"{version_info['timestamp']:08X}"
     sz_hex = f"{version_info['virtual_size']:X}"
     url = f"{SYMBOL_SERVER_URL}/{filename}/{ts_hex}{sz_hex}/{filename}"
     stem = Path(filename).stem
-    ext  = Path(filename).suffix
+    ext = Path(filename).suffix
     local_name = f"{stem}_{version_info['release_version']}{ext}"
     local_path = os.path.join(dest_dir, local_name)
     _stream_to_file(url, local_path, timeout=120)
-    return local_path
+
+    # Download PDB with matching filename pattern to the binary
+    pdb_path: Optional[str] = None
+    pdb_error: Optional[str] = None
+    pdb_info, pdb_parse_error = _get_pdb_info(local_path)
+    if pdb_info:
+        # Name PDB to match the binary's naming pattern: stem_{version}.pdb
+        versioned_pdb_name = f"{stem}_{version_info['release_version']}.pdb"
+        pdb_dest = os.path.join(dest_dir, versioned_pdb_name)
+
+        raw_pdb_path, pdb_download_error = _download_pdb(pdb_info, dest_dir)
+        if raw_pdb_path:
+            # Rename to match binary naming pattern
+            os.rename(raw_pdb_path, pdb_dest)
+            pdb_path = pdb_dest
+        else:
+            pdb_error = pdb_download_error
+    else:
+        pdb_error = pdb_parse_error or f"No PDB debug info found in {filename}"
+
+    return local_path, pdb_path, pdb_error
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
@@ -562,9 +744,13 @@ def fetch_patch_tuesday_cves(month: str = "") -> List[Dict[str, Any]]:
     dt = _parse_month(month) if month else datetime.now()
     slug = f"{dt.year}-{dt.strftime('%b')}"
 
-    r = _http_get(f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30)
+    r = _http_get(
+        f"{MSRC_CVRF_URL}/{slug}", headers={"Accept": "application/json"}, timeout=30
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'.")
+        raise RuntimeError(
+            f"MSRC CVRF API error: HTTP {r.status_code} for month '{slug}'."
+        )
 
     vulnerabilities = r.json().get("Vulnerability", [])
     target_ids = set(WINDOWS_VERSION_PRODUCT_IDS[DEFAULT_WINDOWS_VERSION])
@@ -575,15 +761,19 @@ def fetch_patch_tuesday_cves(month: str = "") -> List[Dict[str, Any]]:
             continue
         cvss = get_cvss_info(vuln)
         title_field = vuln.get("Title", "")
-        cves.append({
-            "CVE_ID": vuln.get("CVE", "N/A"),
-            "Title": title_field.get("Value", "") if isinstance(title_field, dict) else title_field,
-            "Severity": get_severity(vuln),
-            "Exploitability": exploit_str,
-            "CVSS_BaseScore": cvss["BaseScore"],
-            "CVSS_Vector": cvss["Vector"],
-            "KB": _extract_kb_for_vuln(vuln, target_ids),
-        })
+        cves.append(
+            {
+                "CVE_ID": vuln.get("CVE", "N/A"),
+                "Title": title_field.get("Value", "")
+                if isinstance(title_field, dict)
+                else title_field,
+                "Severity": get_severity(vuln),
+                "Exploitability": exploit_str,
+                "CVSS_BaseScore": cvss["BaseScore"],
+                "CVSS_Vector": cvss["Vector"],
+                "KB": _extract_kb_for_vuln(vuln, target_ids),
+            }
+        )
     return cves
 
 
@@ -640,16 +830,20 @@ def fetch_kb_updated_files(
 
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["file_name", "description", "file_version", "previous_version"])
+            writer.writerow(
+                ["file_name", "description", "file_version", "previous_version"]
+            )
             for entry in candidates:
                 pe_path = _resolve_pe_path(entry["file_name"])
                 desc = (_pe_file_description(pe_path) or "") if pe_path else ""
-                writer.writerow([
-                    entry["file_name"],
-                    desc,
-                    entry["file_version"],
-                    entry.get("previous_version") or "",
-                ])
+                writer.writerow(
+                    [
+                        entry["file_name"],
+                        desc,
+                        entry["file_version"],
+                        entry.get("previous_version") or "",
+                    ]
+                )
 
         prev_info = f", diff vs KB{prev_kb}" if prev_kb else ""
         return (
@@ -668,7 +862,8 @@ def download_patch_binaries(
     windows_version: str = WINBINDEX_DEFAULT_WINDOWS_VERSION,
 ) -> Dict[str, Any]:
     """Download the patched and vulnerable versions of a Windows binary from the
-    Microsoft Symbol Server, identified via WinBIndex.
+    Microsoft Symbol Server, identified via WinBIndex. PDBs are automatically
+    downloaded alongside the binaries.
 
     Args:
         filename:        Binary filename, e.g. 'clfs.sys', 'ntoskrnl.exe'.
@@ -676,19 +871,26 @@ def download_patch_binaries(
         windows_version: WinBIndex version key (default '11-24H2').
 
     Returns:
-        Dict with keys: patched_path, vulnerable_path, patched_version,
-        vulnerable_version, error (None on success).
+        Dict with keys: patched_path, vulnerable_path, patched_pdb_path,
+        vulnerable_pdb_path, patched_version, vulnerable_version, error (None on success).
+        PDB paths may be None if PDB download failed.
     """
     result: Dict[str, Any] = {
         "patched_path": None,
         "vulnerable_path": None,
+        "patched_pdb_path": None,
+        "vulnerable_pdb_path": None,
         "patched_version": None,
         "vulnerable_version": None,
+        "patched_pdb_error": None,
+        "vulnerable_pdb_error": None,
         "error": None,
     }
 
     if not re.match(r"^\d{4}-\d{2}$", patch_month):
-        result["error"] = "Invalid patch_month format. Expected YYYY-MM (e.g. '2025-04')."
+        result["error"] = (
+            "Invalid patch_month format. Expected YYYY-MM (e.g. '2025-04')."
+        )
         return result
 
     tmp_dir = tempfile.mkdtemp()
@@ -698,19 +900,37 @@ def download_patch_binaries(
         db_path = os.path.join(tmp_dir, f"{Path(filename).stem}.json.gz")
         _stream_to_file(db_url, db_path, timeout=60)
 
-        patched, vulnerable = _select_patch_versions(db_path, windows_version, patch_month)
+        patched, vulnerable = _select_patch_versions(
+            db_path, windows_version, patch_month
+        )
 
         if not patched:
-            result["error"] = f"No patched version found for {filename} in {patch_month} ({windows_version})."
+            result["error"] = (
+                f"No patched version found for {filename} in {patch_month} ({windows_version})."
+            )
             return result
         if not vulnerable:
-            result["error"] = f"No vulnerable version found for {filename} before {patch_month} ({windows_version})."
+            result["error"] = (
+                f"No vulnerable version found for {filename} before {patch_month} ({windows_version})."
+            )
             return result
 
         os.makedirs(BASE_DIR, exist_ok=True)
-        result["patched_path"]    = _download_symbol(patched,    filename, BASE_DIR)
-        result["vulnerable_path"] = _download_symbol(vulnerable, filename, BASE_DIR)
-        result["patched_version"]    = patched["release_version"]
+
+        patched_binary, patched_pdb, patched_pdb_err = _download_symbol(
+            patched, filename, BASE_DIR
+        )
+        vulnerable_binary, vulnerable_pdb, vulnerable_pdb_err = _download_symbol(
+            vulnerable, filename, BASE_DIR
+        )
+
+        result["patched_path"] = patched_binary
+        result["vulnerable_path"] = vulnerable_binary
+        result["patched_pdb_path"] = patched_pdb
+        result["vulnerable_pdb_path"] = vulnerable_pdb
+        result["patched_pdb_error"] = patched_pdb_err
+        result["vulnerable_pdb_error"] = vulnerable_pdb_err
+        result["patched_version"] = patched["release_version"]
         result["vulnerable_version"] = vulnerable["release_version"]
 
     except Exception as exc:
@@ -718,6 +938,7 @@ def download_patch_binaries(
     finally:
         try:
             import shutil
+
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
@@ -782,11 +1003,13 @@ def list_iat(filename: str) -> Dict[str, Any]:
         dll_path = _resolve_pe_path(dll_name)
         found = dll_path is not None
         description = _pe_file_description(dll_path) if found else None
-        dlls.append({
-            "dll": dll_name,
-            "description": description,
-            "found_in_system32": found,
-        })
+        dlls.append(
+            {
+                "dll": dll_name,
+                "description": description,
+                "found_in_system32": found,
+            }
+        )
 
     result["dlls"] = dlls
     return result
@@ -800,7 +1023,11 @@ def _pe_file_description(pe_path: Path) -> Optional[str]:
             directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
         )
         for file_info_block in getattr(pe, "FileInfo", []):
-            for info in (file_info_block if isinstance(file_info_block, list) else [file_info_block]):
+            for info in (
+                file_info_block
+                if isinstance(file_info_block, list)
+                else [file_info_block]
+            ):
                 if getattr(info, "Key", None) != b"StringFileInfo":
                     continue
                 for st in getattr(info, "StringTable", []):
@@ -815,130 +1042,6 @@ def _pe_file_description(pe_path: Path) -> Optional[str]:
         except Exception:
             pass
     return None
-
-
-# ── PE Index tools ────────────────────────────────────────────────────────────
-
-
-def _pe_index_available() -> bool:
-    return bool(PE_INDEX_DB) and os.path.isdir(os.path.expanduser(PE_INDEX_DB))
-
-
-def _pe_index_collection():
-    db = chromadb.PersistentClient(path=os.path.expanduser(PE_INDEX_DB))
-    return db.get_or_create_collection(
-        name=PE_INDEX_COLLECTION, metadata={"hnsw:space": "cosine"}
-    )
-
-
-def _pe_index_embed(text: str):
-    client = OpenAI(base_url=PE_INDEX_EMBED_URL, api_key="lm-studio")
-    resp = client.embeddings.create(model=PE_INDEX_EMBED_MODEL, input=[text])
-    return resp.data[0].embedding
-
-
-def _extract_description(doc_text: str) -> Optional[str]:
-    """Pull the Description line out of a pe-index markdown document."""
-    parts = doc_text.split("**Description:** ")
-    if len(parts) > 1:
-        return parts[1].split("\n")[0].strip()
-    return None
-
-
-@mcp.tool()
-def search_pe_by_description(keyword: str, top_k: int = 10) -> Dict[str, Any]:
-    """Search Windows PE files (DLL/EXE/SYS) by their FileDescription.
-
-    Resolves a subsystem name or vulnerability title to the actual binary.
-    For example: 'mailslot' → msfs.sys, 'telephony' → tapisrv.dll.
-
-    Args:
-        keyword: Subsystem or description keywords.
-        top_k: Number of results (default 10, max 20).
-    """
-    result: Dict[str, Any] = {"results": [], "count": 0, "error": None}
-
-    if not _pe_index_available():
-        result["error"] = "PE_INDEX_DB not configured or path does not exist."
-        return result
-
-    top_k = min(max(top_k, 1), 20)
-
-    try:
-        col = _pe_index_collection()
-        qe = _pe_index_embed(keyword)
-        raw = col.query(
-            query_embeddings=[qe],
-            n_results=top_k,
-            where={"source": "pe-index"},
-            include=["documents", "metadatas", "distances"],
-        )
-
-        if not raw["ids"][0]:
-            return result
-
-        for i in range(len(raw["ids"][0])):
-            meta = raw["metadatas"][0][i]
-            dist = raw["distances"][0][i]
-            desc = _extract_description(raw["documents"][0][i])
-            result["results"].append({
-                "name": meta.get("name", "?"),
-                "description": desc,
-                "type": meta.get("type", "?"),
-                "location": meta.get("location", "?"),
-                "version": meta.get("version", ""),
-                "similarity": round(1 - dist, 4),
-            })
-
-        result["count"] = len(result["results"])
-    except Exception as e:
-        result["error"] = f"PE index search error: {e}"
-
-    return result
-
-
-@mcp.tool()
-def search_pe_by_name(filename: str) -> Dict[str, Any]:
-    """Look up a PE file by exact filename to get its description and metadata.
-
-    Args:
-        filename: Exact PE filename, e.g. 'msfs.sys', 'profsvc.dll'.
-    """
-    result: Dict[str, Any] = {
-        "name": filename,
-        "description": None,
-        "type": None,
-        "location": None,
-        "version": None,
-        "found": False,
-        "error": None,
-    }
-
-    if not _pe_index_available():
-        result["error"] = "PE_INDEX_DB not configured or path does not exist."
-        return result
-
-    try:
-        col = _pe_index_collection()
-        raw = col.get(
-            where={"$and": [{"source": "pe-index"}, {"name": filename}]},
-            include=["documents", "metadatas"],
-        )
-
-        if not raw["ids"]:
-            return result
-
-        meta = raw["metadatas"][0]
-        result["found"] = True
-        result["type"] = meta.get("type")
-        result["location"] = meta.get("location")
-        result["version"] = meta.get("version")
-        result["description"] = _extract_description(raw["documents"][0])
-
-    except Exception as e:
-        result["error"] = f"PE index lookup error: {e}"
-
-    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
