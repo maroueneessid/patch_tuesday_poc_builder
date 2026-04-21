@@ -106,21 +106,58 @@ def find_first_non_empty_match(search_dtms, empty_dt):
     return None
 
 def get_search_dtms():
-    """Return list of all DTMs."""
-    tool = state.getTool()
-    if tool is None:
-        dbg("No tool context; open in GUI.")
-        return []
-    service = tool.getService(DataTypeManagerService)
-    if service is None:
-        dbg("DataTypeManagerService not available.")
+    from ghidra.program.model.data import FileDataTypeManager
+    from java.io import File
+
+    # Try GUI service first
+    try:
+        tool = state.getTool()
+        if tool is not None:
+            from ghidra.app.services import DataTypeManagerService
+            service = tool.getService(DataTypeManagerService)
+            if service is not None:
+                all_dtms = list(service.getDataTypeManagers())
+                if all_dtms:
+                    dbg("Using GUI DTMs (%d)" % len(all_dtms))
+                    return all_dtms
+    except:
+        pass
+
+    # Headless: try sourceFile first, then fall back to script args
+    gdt_dir = None
+    try:
+        gdt_dir = sourceFile.getParentFile()
+        dbg("Script dir from sourceFile: %s" % gdt_dir)
+    except:
+        pass
+
+    if gdt_dir is None:
+        try:
+            args = getScriptArgs()
+            if args and len(args) > 0:
+                gdt_dir = File(args[0])
+                if not gdt_dir.isDirectory():
+                    gdt_dir = gdt_dir.getParentFile()
+                dbg("Script dir from scriptArgs: %s" % gdt_dir)
+        except:
+            pass
+
+    if gdt_dir is None:
+        dbg("Cannot resolve script directory")
         return []
 
+    dtms = []
+    for f in gdt_dir.listFiles():
+        if f.getName().lower().endswith(".gdt"):
+            try:
+                dtm = FileDataTypeManager.openFileArchive(f, False)
+                dtms.append(dtm)
+                dbg("Auto-loaded GDT: %s" % f.getAbsolutePath())
+            except Exception as e:
+                dbg("Failed to open GDT %s: %s" % (f.getName(), e))
 
-    all_dtms = list(service.getDataTypeManagers())
-    dbg("All open DTMs (%d): %s" % (len(all_dtms), ", ".join(safe_dtm_name(d) for d in all_dtms)))
-    
-    return all_dtms
+    dbg("Headless DTMs loaded: %d" % len(dtms))
+    return dtms
 
     # search = []
     # prog_dtm = get_program_dtm()
