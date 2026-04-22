@@ -188,3 +188,39 @@ After a successful run, `/output` (or your `--project-dir`) will contain:
 - Any additional artifacts written by the Jython scripts (e.g., updated datatype archives if the scripts are extended to export them).
 
 ---
+
+## Troubleshooting
+
+### Project Ownership Issues
+
+If you encounter ownership errors when opening Ghidra projects created by the container (e.g., "Project is owned by another user"), you can manually fix the project ownership using the provided utility scripts:
+
+#### Linux / macOS (`fix_ownership.sh`)
+
+```bash
+./fix_ownership.sh /path/to/ghidra_projects [username]
+```
+
+- If `username` is omitted, defaults to the current user (`$(whoami)`).
+- Patches all `project.prp` files found under the given directory.
+
+#### Windows (`fix_ownership.ps1`)
+
+```powershell
+.\fix_ownership.ps1 -ProjectDir C:\path\to\ghidra_projects [-Username YourUsername]
+```
+
+- If `-Username` is omitted, defaults to `$env:USERNAME`.
+- Patches all `project.prp` files found under the given directory.
+
+#### What These Scripts Do
+
+Ghidra stores project ownership in `.rep/project.prp` files with entries like:
+
+```
+NAME="OWNER" TYPE="string" VALUE="container_user"
+```
+
+These scripts recursively find all `project.prp` files and update the `OWNER` value to your specified username, allowing you to open the projects in the Ghidra GUI without permission errors.
+
+---

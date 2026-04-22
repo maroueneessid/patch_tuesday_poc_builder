@@ -24,8 +24,9 @@ Requires:
 """
 
 import argparse
-import sys
 import os
+import sys
+import time
 from pathlib import Path
 
 # Force UTF-8 on Windows if not already set
@@ -71,16 +72,21 @@ def main():
         description="Headless Ghidra batch analysis via pyhidra"
     )
     parser.add_argument(
-        "binary_dir", type=Path,
-        help="Directory containing binaries and co-located .pdb files"
+        "binary_dir",
+        type=Path,
+        help="Directory containing binaries and co-located .pdb files",
     )
     parser.add_argument(
-        "--scripts-dir", type=Path, default=Path("./ghidra_scripts"),
-        help="Directory containing post-analysis Ghidra scripts (default: ./ghidra_scripts/)"
+        "--scripts-dir",
+        type=Path,
+        default=Path("./ghidra_scripts"),
+        help="Directory containing post-analysis Ghidra scripts (default: ./ghidra_scripts/)",
     )
     parser.add_argument(
-        "--project-dir", type=Path, default=Path("./ghidra_projects"),
-        help="Where to store Ghidra projects (default: ./ghidra_projects/)"
+        "--project-dir",
+        type=Path,
+        default=Path("./ghidra_projects"),
+        help="Where to store Ghidra projects (default: ./ghidra_projects/)",
     )
 
     args = parser.parse_args()
@@ -113,16 +119,11 @@ def main():
     project_dir.mkdir(parents=True, exist_ok=True)
 
     import pyhidra
+    from pyhidra.launcher import HeadlessPyhidraLauncher
 
-    # Override Java's user.name so Ghidra projects aren't locked to a specific user.
-    # Set GHIDRA_USER env var to your host username, or leave empty for portable projects.
-    ghidra_user = os.environ.get("GHIDRA_USER", "")
-    if ghidra_user:
-        from pyhidra.launcher import HeadlessPyhidraLauncher
-        launcher = HeadlessPyhidraLauncher()
-        launcher.add_vmargs(f"-Duser.name={ghidra_user}")
-        launcher.start()
-    
+    launcher = HeadlessPyhidraLauncher()
+    launcher.start()
+
     for i, binary_path in enumerate(binaries, 1):
         pdb_path = check_pdb(binary_path)
 
@@ -146,6 +147,7 @@ def main():
             print(f"  Analyzing (with PDB)...")
             from ghidra.app.script import GhidraScriptUtil
             from ghidra.program.util import GhidraProgramUtilities
+
             GhidraScriptUtil.acquireBundleHostReference()
             flat_api.analyzeAll(program)
             # Mark as analyzed (method name varies by Ghidra version)
@@ -182,25 +184,6 @@ def main():
 
     print("Done.")
 
-    # Patch .gpr project files to remove owner restriction so any user can open them.
-    # Ghidra stores OWNER=<username> in the .gpr XML. We remove it.
-    import glob
-    import re
-    for gpr in glob.glob(str(project_dir / "**" / "*.gpr"), recursive=True):
-        try:
-            with open(gpr, "r", encoding="utf-8") as f:
-                content = f.read()
-            if not content.strip():
-                print(f"[WARN] Empty .gpr file: {gpr}")
-                continue
-            patched = re.sub(r'\s+OWNER="[^"]*"', '', content)
-            with open(gpr, "w", encoding="utf-8") as f:
-                f.write(patched)
-            print(f"Patched ownership in: {gpr}")
-        except Exception as e:
-            print(f"[WARN] Could not patch {gpr}: {e}")
-
-    # Force exit — JVM background threads prevent clean shutdown
     os._exit(0)
 
 
