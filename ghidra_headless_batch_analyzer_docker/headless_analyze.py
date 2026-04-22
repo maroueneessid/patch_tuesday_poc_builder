@@ -114,6 +114,15 @@ def main():
 
     import pyhidra
 
+    # Override Java's user.name so Ghidra projects aren't locked to a specific user.
+    # Set GHIDRA_USER env var to your host username, or leave empty for portable projects.
+    ghidra_user = os.environ.get("GHIDRA_USER", "")
+    if ghidra_user:
+        from pyhidra.launcher import HeadlessPyhidraLauncher
+        launcher = HeadlessPyhidraLauncher()
+        launcher.add_vmargs(f"-Duser.name={ghidra_user}")
+        launcher.start()
+    
     for i, binary_path in enumerate(binaries, 1):
         pdb_path = check_pdb(binary_path)
 
@@ -173,19 +182,27 @@ def main():
 
     print("Done.")
 
-    # Release the bundle host reference and shut down
-    try:
-        from ghidra.app.script import GhidraScriptUtil
-        GhidraScriptUtil.releaseBundleHostReference()
-    except Exception:
-        pass
+    # Patch .gpr project files to remove owner restriction so any user can open them.
+    # Ghidra stores OWNER=<username> in the .gpr XML. We remove it.
+    import glob
+    import re
+    for gpr in glob.glob(str(project_dir / "**" / "*.gpr"), recursive=True):
+        try:
+            with open(gpr, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.strip():
+                print(f"[WARN] Empty .gpr file: {gpr}")
+                continue
+            patched = re.sub(r'\s+OWNER="[^"]*"', '', content)
+            with open(gpr, "w", encoding="utf-8") as f:
+                f.write(patched)
+            print(f"Patched ownership in: {gpr}")
+        except Exception as e:
+            print(f"[WARN] Could not patch {gpr}: {e}")
 
-    # Force JVM shutdown
-    import jpype
-    if jpype.isJVMStarted():
-        jpype.shutdownJVM()
+    # Force exit — JVM background threads prevent clean shutdown
+    os._exit(0)
 
 
 if __name__ == "__main__":
     main()
-    os._exit(0)
