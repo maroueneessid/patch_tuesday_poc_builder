@@ -82,7 +82,6 @@ For detailed documentation on what each script does, see the [Ghidra pipeline RE
       ],
       "env": {
         "BASE_DIR": "C:/path/to/patch_bins",
-        "PE_INDEX_DB": "C:/path/to/pe-index.chromadb"
       }
     }
   }

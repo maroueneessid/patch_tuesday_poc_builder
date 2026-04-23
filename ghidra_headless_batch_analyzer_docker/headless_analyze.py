@@ -5,17 +5,18 @@ Headless batch analysis pipeline using pyhidra (Ghidra 11.0.3 + BinExport).
 
 Usage:
     set PYTHONUTF8=1
-    python headless_analyze.py <binary_dir> [--scripts-dir <path>] [--project-dir <path>]
+    python headless_analyze.py <binary_dir> [--scripts-dir <path>] [--project-dir <path>] [--project-name <name>]
 
 Arguments:
     binary_dir      Directory containing binaries (.exe, .dll, .sys) and co-located .pdb files.
-                    The directory name becomes the Ghidra project name.
 
 Options:
     --scripts-dir   Directory containing post-analysis Ghidra scripts.
                     Defaults to ./ghidra_scripts/
     --project-dir   Where to create the Ghidra project.
                     Defaults to ./ghidra_projects/
+    --project-name  Name for the Ghidra project.
+                    Defaults to the binary directory name.
 
 Requires:
     pip install pyhidra
@@ -88,6 +89,12 @@ def main():
         default=Path("./ghidra_projects"),
         help="Where to store Ghidra projects (default: ./ghidra_projects/)",
     )
+    parser.add_argument(
+        "--project-name",
+        type=str,
+        default=None,
+        help="Name for the Ghidra project (default: binary directory name)",
+    )
 
     args = parser.parse_args()
 
@@ -108,7 +115,7 @@ def main():
         print(f"[ERROR] No binaries found in {binary_dir}")
         sys.exit(1)
 
-    project_name = binary_dir.name
+    project_name = args.project_name if args.project_name else binary_dir.name
 
     print(f"Project:    {project_name}")
     print(f"Binaries:   {len(binaries)} found in {binary_dir}")

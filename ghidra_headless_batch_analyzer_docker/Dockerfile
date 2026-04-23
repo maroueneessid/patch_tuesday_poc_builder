@@ -53,8 +53,11 @@ ENV GHIDRA_USER=""
 # /output — bind-mount your output directory here at runtime
 VOLUME ["/input", "/output"]
 
-ENTRYPOINT ["python3", "/opt/ghidra-pipeline/headless_analyze.py"]
-# Default args — override at runtime
-CMD ["/input", \
-     "--scripts-dir", "/opt/ghidra-pipeline/Scripts", \
-     "--project-dir", "/output"]
+# Fixed arguments in ENTRYPOINT, only project name value is passed via CMD
+# Usage: docker run -v /path/to/binaries:/input -v /path/to/output:/output <image> <project-name>
+ENTRYPOINT ["python3", "/opt/ghidra-pipeline/headless_analyze.py", \
+            "/input", \
+            "--scripts-dir", "/opt/ghidra-pipeline/Scripts", \
+            "--project-dir", "/output", \
+            "--project-name"]
+CMD ["DefaultProject"]
