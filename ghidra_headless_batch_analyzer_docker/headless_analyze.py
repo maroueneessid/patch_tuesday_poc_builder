@@ -60,12 +60,17 @@ def check_pdb(binary_path: Path):
 
 def apply_pdb(flat_api, program, pdb_path: Path):
     """Set PDB file for the PDB Universal analyzer before analysis."""
-    from ghidra.app.plugin.core.analysis import PdbUniversalAnalyzer
-    from java.io import File as JFile
+    try:
+        from ghidra.app.plugin.core.analysis import PdbUniversalAnalyzer
+        from java.io import File as JFile
 
-    pdb_file = JFile(str(pdb_path))
-    PdbUniversalAnalyzer.setPdbFileOption(program, pdb_file)
-    print(f"  PDB configured: {pdb_path.name}")
+        pdb_file = JFile(str(pdb_path))
+        PdbUniversalAnalyzer.setPdbFileOption(program, pdb_file)
+        print(f"  PDB configured: {pdb_path.name}")
+        return True
+    except Exception as e:
+        print(f"  [WARN] Failed to configure PDB: {e}")
+        return False
 
 
 def main():
@@ -94,6 +99,11 @@ def main():
         type=str,
         default=None,
         help="Name for the Ghidra project (default: binary directory name)",
+    )
+    parser.add_argument(
+        "--skip-pdb",
+        action="store_true",
+        help="Skip PDB symbol loading (useful if PDB analyzer causes issues)",
     )
 
     args = parser.parse_args()
@@ -138,34 +148,40 @@ def main():
 
         # Phase 1: Import with analyze=False, apply PDB, then analyze
         print(f"  Importing...")
-        with pyhidra.open_program(
-            str(binary_path),
-            project_name=project_name,
-            project_location=str(project_dir),
-            analyze=False,
-        ) as flat_api:
-            program = flat_api.getCurrentProgram()
+        try:
+            with pyhidra.open_program(
+                str(binary_path),
+                project_name=project_name,
+                project_location=str(project_dir),
+                analyze=False,
+            ) as flat_api:
+                program = flat_api.getCurrentProgram()
 
-            # Apply PDB before analysis
-            if pdb_path:
-                apply_pdb(flat_api, program, pdb_path)
+                # Apply PDB before analysis (unless skipped)
+                if pdb_path and not args.skip_pdb:
+                    apply_pdb(flat_api, program, pdb_path)
 
-            # Now analyze with PDB configured
-            print(f"  Analyzing (with PDB)...")
-            from ghidra.app.script import GhidraScriptUtil
-            from ghidra.program.util import GhidraProgramUtilities
+                # Now analyze with PDB configured
+                print(f"  Analyzing...")
+                from ghidra.app.script import GhidraScriptUtil
+                from ghidra.program.util import GhidraProgramUtilities
 
-            GhidraScriptUtil.acquireBundleHostReference()
-            flat_api.analyzeAll(program)
-            # Mark as analyzed (method name varies by Ghidra version)
-            try:
-                GhidraProgramUtilities.markProgramAnalyzed(program)
-            except AttributeError:
+                GhidraScriptUtil.acquireBundleHostReference()
+                flat_api.analyzeAll(program)
+                # Mark as analyzed (method name varies by Ghidra version)
                 try:
-                    GhidraProgramUtilities.setAnalyzedFlag(program, True)
+                    GhidraProgramUtilities.markProgramAnalyzed(program)
                 except AttributeError:
-                    pass  # Not critical
-            print(f"  Analysis complete: {program.getName()}")
+                    try:
+                        GhidraProgramUtilities.setAnalyzedFlag(program, True)
+                    except AttributeError:
+                        pass  # Not critical
+                print(f"  Analysis complete: {program.getName()}")
+
+        except Exception as e:
+            print(f"  [ERROR] Failed to process {binary_path.name}: {e}")
+            print(f"  Skipping to next binary...")
+            continue
 
         # Phase 2: Run each post-script
         for script_name in POST_SCRIPTS:
@@ -186,6 +202,9 @@ def main():
                 )
             except Exception as e:
                 print(f"  [ERROR] {script_name} failed: {e}")
+                import traceback
+
+                traceback.print_exc()
 
         print()
 

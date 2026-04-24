@@ -12,8 +12,9 @@ WORKDIR /opt/ghidra-pipeline
 # Copy Ghidra installation
 COPY ghidra_11.0.3_PUBLIC/ /opt/ghidra/
 
-# Install pyhidra
-RUN pip3 install --no-cache-dir pyhidra
+# Install pyhidra (pinned to version compatible with Ghidra 11.0.3)
+# pyhidra 1.2.0 is compatible with Ghidra 11.0.x releases
+RUN pip3 install --no-cache-dir pyhidra==1.2.0
 
 # Install extensions into Ghidra's system extensions directory.
 # Each .zip is expected to contain a top-level folder with extension.properties.

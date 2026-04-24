@@ -25,7 +25,7 @@ Given a directory of binaries (and optional co-located `.pdb` files), the pipeli
 | **Ghidra** | 11.0.3 PUBLIC |
 | **Java** | 17 (Eclipse Temurin `17-jdk-jammy`) |
 | **Python** | 3 (via `python3`, `python3-pip`) |
-| **pyhidra** | Latest from PyPI (04.22.2026) |
+| **pyhidra** | 1.2.0 (pinned for Ghidra 11.0.3 compatibility) |
 | **BinExport Extension** | `ghidra_11.0.3_PUBLIC_20240417_BinExport.zip` |
 | **Protobuf** | 3.25.1 (shipped with BinExport; overrides Ghidra’s 3.21.8) |
 
@@ -34,18 +34,21 @@ Given a directory of binaries (and optional co-located `.pdb` files), the pipeli
 ## Project Layout
 
 ```
-Ghidra/
+ghidra_headless_batch_analyzer_docker/
 ├── Dockerfile                          # Container build definition
 ├── headless_analyze.py                 # Python entrypoint (pyhidra)
-├── ghidra_11.0.3_PUBLIC/               # Ghidra installation
+├── ghidra_11.0.3_PUBLIC/               # Ghidra installation (extracted)
 ├── extensions/
 │   └── ghidra_11.0.3_PUBLIC_20240417_BinExport.zip
-└── Scripts/                            # Jython post-analysis scripts
-    ├── CppClassExtractor.py            # C++ class / vtable recovery
-    ├── DatatypeMerger.py               # Empty composite backfill from .gdt
-    ├── post_script_export_binexports.py# Export to BinExport
-    ├── Windows_Driver_functons.gdt     # Windows driver function types
-    └── wdk_full_26100.gdt              # WDK data type archive
+├── Scripts/                            # Jython post-analysis scripts
+│   ├── CppClassExtractor.py            # C++ class / vtable recovery
+│   ├── DatatypeMerger.py               # Empty composite backfill from .gdt
+│   ├── post_script_export_binexports.py# Export to BinExport
+│   ├── Windows_Driver_functons.gdt     # Windows driver function types
+│   └── wdk_full_26100.gdt              # WDK data type archive
+├── fix_ownership.sh                    # Linux/macOS project ownership fix
+├── fix_ownership.ps1                   # Windows project ownership fix
+└── ghidra-analyze.md                   # Skill definition for invoking the analyzer
 ```
 
 ---
@@ -111,12 +114,17 @@ The following issues are documented in inline comments in `headless_analyze.py` 
 
 ## Build
 
-- Extract ghidra to root. 
+1. **Extract Ghidra** — Download Ghidra 11.0.3 PUBLIC and extract it so that `ghidra_11.0.3_PUBLIC/` is in the same directory as the Dockerfile.
 
-- From the repository root:
-```bash
-docker build -t ghidra-pipeline .
-```
+2. **Add BinExport extension** — Place the BinExport extension zip in the `extensions/` directory:
+   ```
+   extensions/ghidra_11.0.3_PUBLIC_20240417_BinExport.zip
+   ```
+
+3. **Build the image**:
+   ```bash
+   docker build -t ghidra-pipeline .
+   ```
 
 > **Prerequisites:**
 > - Docker daemon running
@@ -138,8 +146,9 @@ docker run --rm \
   ghidra-pipeline
 ```
 
-### Arguments
-You can override the default `CMD` to pass custom directories:
+### Overriding the Project Name
+
+The Dockerfile's `ENTRYPOINT` bakes in the input directory (`/input`), scripts directory, and output directory (`/output`). The only argument you can override via `CMD` is the **project name**:
 
 ```bash
 docker run --rm \
@@ -147,10 +156,10 @@ docker run --rm \
   -v /path/to/your/output:/output \
   -e GHIDRA_USER=$USER \
   ghidra-pipeline \
-  /input \
-  --scripts-dir /opt/ghidra-pipeline/Scripts \
-  --project-dir /output
+  MyCustomProjectName
 ```
+
+If you need different mount points or directories, use the **Native (Non-Docker) Usage** method instead.
 
 ### Environment Variables
 
@@ -176,6 +185,44 @@ export PYTHONUTF8=1
 export GHIDRA_INSTALL_DIR=/path/to/ghidra_11.0.3_PUBLIC
 python3 headless_analyze.py /path/to/binaries --scripts-dir ./Scripts --project-dir ./ghidra_projects
 ```
+
+---
+
+## Troubleshooting
+
+### `StringIndexOutOfBoundsException` During Analysis
+
+**Symptom:** Analysis fails with:
+```
+java.lang.java.lang.StringIndexOutOfBoundsException: begin 4, end 3, length 3
+```
+
+**Cause:** This is typically caused by:
+1. **pyhidra version mismatch** - Using a pyhidra version incompatible with Ghidra 11.0.3
+2. **PDB analyzer issue** - The PDB Universal analyzer encountering an unexpected path format
+
+**Solutions:**
+
+1. **Rebuild the Docker image** to ensure pyhidra 1.2.3 is installed:
+   ```bash
+   docker build --no-cache -t ghidra-pipeline .
+   ```
+
+2. **Skip PDB loading** if the error persists:
+   - Modify the Dockerfile `CMD` to add `--skip-pdb`:
+     ```dockerfile
+     CMD ["DefaultProject", "--skip-pdb"]
+     ```
+   - Or run with custom arguments:
+     ```bash
+     docker run --rm \
+       -v /path/to/binaries:/input \
+       -v /path/to/output:/output \
+       ghidra-pipeline \
+       MyProject --skip-pdb
+     ```
+
+3. **Check binary compatibility** - Some binaries with unusual paths or names may cause issues. The script now continues processing remaining binaries even if one fails.
 
 ---
 
