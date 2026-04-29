@@ -1,0 +1,16 @@
+{
+  "ghidra-mcp": {
+    "command": "python3",
+    "args": [
+      "path\\to\\ghidra_mcp\\bridge_mcp_ghidra.py",
+      "--transport",
+      "stdio",
+      "--no-lazy"
+    ],
+    "env": {
+      "GHIDRA_DEBUGGER_URL": "http://127.0.0.1:8099",
+      "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
+      "PYTHONIOENCODING": "utf-8"
+    }
+  }
+}

@@ -1,13 +1,19 @@
-# AI Assistance in Windows Internals reverse engineering and patch diffing toolkit
+# AI Assistance in Windows Internals Reverse Engineering and Patch Diffing Toolkit
+
 ---
 
 ## Overview
 
-This project consists of two main components:
+This project provides an automated toolkit for triaging CVEs from Microsoft Patch Tuesday, identifying updated binaries via KB file manifests, and using Ghidra + BinDiff to analyze binary differences. It consists of three main components:
 
-1. **Patch Diffing Workflow** — Automated tools for triaging CVEs from Microsoft Patch Tuesday, identifying updated binaries via KB file manifests, and using Ghidra + BinDiff to analyze binary differences.
+1. **Patch Diffing Workflow** — Automated tools for CVE triage, KB file discovery, and binary diffing analysis.
 
-2. **Ghidra Headless Batch Analyzer** — A containerized, headless batch analysis pipeline built around Ghidra 11.0.3. It automates importing Windows binaries, applying PDB symbols, running C++ class recovery and datatype enrichment scripts, and exporting results to BinExport format — all without opening the GUI.
+2. **Ghidra Headless Batch Analyzer** — A containerized, headless batch analysis pipeline built around Ghidra 11.0.3. It automates importing Windows binaries, applying PDB symbols, running C++ class recovery and datatype enrichment scripts, and exporting results to BinExport format.
+
+3. **MCP Servers** — Three Model Context Protocol servers for AI assistant integration:
+   - **Patch Tuesday Triage** — CVE triage and KB file discovery
+   - **BinDiff Analysis** — Cross-platform BinDiff analysis with automatic platform detection
+   - **Ghidra MCP Bridge** — Direct Ghidra integration for interactive analysis
 
 > **See [ghidra_headless_batch_analyzer_docker/README.md](ghidra_headless_batch_analyzer_docker/README.md) for detailed documentation on the Ghidra pipeline, including build instructions, usage, and technical issues encountered during development.**
 
@@ -15,38 +21,56 @@ This project consists of two main components:
 
 ## Components
 
-### Patch Diffing Workflow
+### MCP Servers
 
-| Tool | Purpose |
-|------|---------|
-| `mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py` | Fetches high-exploitability CVEs from Microsoft MSRC CVRF API |
-| `bindiff_high_roi_to_csv.py` | Runs BinDiff headlessly and exports changed functions to CSV |
-| `mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py` | MCP server exposing CVE triage, KB file discovery, IAT analysis, and PE index search |
+| Server | Purpose |
+|--------|---------|
+| `mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py` | CVE triage, KB file discovery, IAT analysis, and PE index search |
+| `mcp_server/bindiff_analysis/bindiff_analysis_mcp_server.py` | BinDiff headless analysis with cross-platform support (Windows/Linux) |
+| `mcp_server/ghidra_mcp/bridge_mcp_ghidra.py` | Ghidra MCP bridge for direct Ghidra integration |
 
-> **Note:** Binary discovery is now KB-CSV-based (see workflow below). The previous WinBIndex/COMPONENT_MAP approach (`fetch_cve_related_pre_post_patch_binaries.py`) has been removed.
+### Ghidra MCP Bridge Setup
 
-### Ghidra Headless Batch Analyzer
+The Ghidra MCP bridge is from [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp). To set up:
 
-A Docker-based pipeline for automated binary analysis. See the [dedicated README](ghidra_headless_batch_analyzer_docker/README.md) for full details.
+```bash
+git clone https://github.com/bethington/ghidra-mcp
+cd ghidra-mcp
+docker build -t ghidra-mcp-headless:latest -f docker/Dockerfile .
+```
 
-**Key features:**
-- Imports and analyzes binaries with Ghidra's auto-analysis
-- Applies PDB symbols before analysis (if co-located with binaries)
-- Runs post-analysis scripts: C++ class recovery, datatype enrichment from .gdt archives
-- Exports to `.BinExport` format for BinDiff
-- Handles project ownership for cross-user compatibility
+**MCP Configuration:**
+```json
+{
+  "ghidra-mcp": {
+    "command": "python3",
+    "args": ["path/to/bridge_mcp_ghidra.py", "--transport", "stdio", "--no-lazy"],
+    "env": {
+      "GHIDRA_DEBUGGER_URL": "http://127.0.0.1:8099",
+      "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
+      "PYTHONIOENCODING": "utf-8"
+    }
+  }
+}
+```
+
+> **Note:** For binding on 0.0.0.0, an `AUTH_TOKEN` variable is required (hardcoded in docker-compose and bridge script).
 
 ---
 
 ## Ghidra Scripts
 
-The Ghidra scripts are now located in `ghidra_headless_batch_analyzer_docker/Scripts/`. Brief descriptions:
+Located in `ghidra_headless_batch_analyzer_docker/Scripts/`:
 
 | Script | Purpose |
 |--------|---------|
-| `CppClassExtractor.py` | Recovers C++ class structure from MSVC-compiled binaries using decompiler output |
-| `DatatypeMerger.py` | Replaces empty/undefined composite types with definitions from external GDT archives |
-| `post_script_export_binexports.py` | Exports the current program to a `.BinExport` file for BinDiff |
+| `CppClassExtractor.py` | Recovers C++ class structure from MSVC-compiled binaries using decompiler output. Identifies vtables, constructors, and infers member fields from typed assignments. |
+| `DatatypeMerger.py` | Backfills empty/undefined composite types by matching names against external `.gdt` archives (e.g., WDK type libraries). |
+| `post_script_export_binexports.py` | Exports the current program to a `.BinExport` file for BinDiff analysis. |
+
+**GDT Archives:**
+- `wdk_full_26100.gdt` — Windows Driver Kit type definitions for Windows 26100
+- `Windows_Driver_functons.gdt` — Windows driver function types
 
 For detailed documentation on what each script does, see the [Ghidra pipeline README](ghidra_headless_batch_analyzer_docker/README.md#what-each-script-does).
 
@@ -56,32 +80,44 @@ For detailed documentation on what each script does, see the [Ghidra pipeline RE
 
 ### Prerequisites
 
-- Ghidra 11.0.3 PUBLIC (download from [official release](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.3_build/ghidra_11.0.3_PUBLIC_20240410.zip))
-- BinExport extension (install via File → Install Extensions)
-- BinDiff
-- Python with required packages (`pip install requests beautifulsoup4 pefile chromadb openai mcp` for MCP server)
-- LM Studio running locally at `http://localhost:1234` (for PE index embedding, if used)
+- **Ghidra 11.0.3 PUBLIC** — Download from [official release](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.3_build/ghidra_11.0.3_PUBLIC_20240410.zip)
+- **BinExport extension** — Install via Ghidra File → Install Extensions
+- **BinDiff** — Install from [zynamics](https://www.zynamics.com/bindiff.html)
+- **Python 3.10+** with required packages
+- **Docker** (for Ghidra headless pipeline)
+- **LM Studio** running locally at `http://localhost:1234` (for PE index embedding, optional)
 
-### Patch Diffing Setup
+### Install Python Dependencies
 
-1. Clone the repository and navigate to the directory
-2. Ensure Ghidra is installed and BinExport/BinDiff extensions are active
-3. Install MCP server dependencies:
-   ```bash
-   pip install requests beautifulsoup4 pefile chromadb openai mcp
-   ```
-4. (Optional) Configure MCP client for patch triage tools:
+```bash
+pip install requests beautifulsoup4 pefile chromadb openai mcp
+```
+
+### MCP Client Configuration
 
 ```json
 {
   "mcpServers": {
     "patch-tuesday": {
       "command": "python",
-      "args": [
-        "C:/path/to/patchDiffingNotes/mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py"
-      ],
+      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py"],
       "env": {
-        "BASE_DIR": "C:/path/to/patch_bins",
+        "BASE_DIR": "C:/path/to/patch_bins"
+      }
+    },
+    "bindiff-analysis": {
+      "command": "python",
+      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/bindiff_analysis/bindiff_analysis_mcp_server.py"],
+      "env": {
+        "BINDIFF_PATH": "C:/path/to/bindiff.exe"
+      }
+    },
+    "ghidra-mcp": {
+      "command": "python",
+      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/ghidra_mcp/bridge_mcp_ghidra.py", "--transport", "stdio", "--no-lazy"],
+      "env": {
+        "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
+        "PYTHONIOENCODING": "utf-8"
       }
     }
   }
@@ -106,68 +142,60 @@ The workflow is KB-driven: instead of resolving binaries from individual CVE tag
 
 **Supported platform:** Windows 11 25H2 x64 only.
 
-1. **Triage CVEs** (via MCP tool or standalone script):
-   ```bash
-   python mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py --month 2026-03
-   ```
-   Returns high-exploitability CVEs (`Exploitation Detected` / `Exploitation More Likely`) with severity, CVSS score, and the KB number that patches them on 25H2.
+#### 1. Triage CVEs
 
-2. **Discover updated binaries for the month** (via MCP tool `fetch_kb_updated_files`):
-   - Resolves the cumulative update KB from MSRC CVRF
-   - Downloads the file-version CSV from `support.microsoft.com/help/{KB}`
-   - Filters for x64 `.exe`/`.dll`/`.sys` files
-   - Diffs against the previous month's KB to find version-changed files only
-   - Enriches each entry with `FileDescription` from the local PE on disk
-   - Saves a CSV to `BASE_DIR/{month}_KB{kb}_11-25H2_updated_files.csv`
+```bash
+python mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py --month 2025-04
+```
 
-3. **Cross-reference CVEs with updated binaries** — use the CVE list from step 1 and the file list from step 2 to identify which changed binaries are associated with high-exploitability vulnerabilities.
+Or use the MCP tool `fetch_patch_tuesday_cves` to get high-exploitability CVEs (`Exploitation Detected` / `Exploitation More Likely`) with severity, CVSS score, and the KB number that patches them on 25H2.
 
-4. **Analyze with Ghidra Headless Pipeline:**
-   - Place pre/post-patch binaries in input directory
-   - Run the Docker container (see [Ghidra pipeline README](ghidra_headless_batch_analyzer_docker/README.md))
-   - This executes: PDB symbol application → auto-analysis → C++ class extraction → datatype merging → BinExport generation
+#### 2. Discover Updated Binaries
 
-5. **Generate diff report:**
-   ```bash
-   python bindiff_high_roi_to_csv.py primary.BinExport secondary.BinExport
-   ```
+Use the MCP tool `fetch_kb_updated_files`:
+- Resolves the cumulative update KB from MSRC CVRF
+- Downloads the file-version CSV from `support.microsoft.com/help/{KB}`
+- Filters for x64 `.exe`/`.dll`/`.sys` files
+- Diffs against the previous month's KB to find version-changed files only
+- Enriches each entry with `FileDescription` from the local PE on disk
+- Saves a CSV to `BASE_DIR/{month}_KB{kb}_11-25H2_updated_files.csv`
 
-6. **Visual inspection:** Open the `.BinDiff` file in BinDiff GUI for detailed analysis
+#### 3. Cross-Reference CVEs with Updated Binaries
 
----
+Use the CVE list from step 1 and the file list from step 2 to identify which changed binaries are associated with high-exploitability vulnerabilities.
 
-## MCP Server Tools
+#### 4. Analyze with Ghidra Headless Pipeline
 
-### Patch Tuesday MCP Server (`patch-tuesday`)
+```bash
+docker run --rm \
+  -v /path/to/binaries:/input \
+  -v /path/to/output:/output \
+  -e GHIDRA_USER=$USER \
+  ghidra-pipeline
+```
 
-| Tool | Arguments | Returns |
-|------|-----------|--------|
-| `fetch_patch_tuesday_cves` | `month` (YYYY-MM or YYYY-Mon, default: current) | List of high-exploitability CVEs with severity, CVSS, exploitability, and KB number for 25H2 |
-| `fetch_kb_updated_files` | `month`, `windows_version` (default: `11-25H2`), `compare_with_previous` (default: `True`) | Saves CSV to `BASE_DIR`; returns summary string with path and counts |
-| `list_iat` | `filename` (PE filename, no path separators) | IAT of a PE from System32/drivers with DLL FileDescriptions |
-| `search_pe_by_description` | `keyword`, `top_k` (default 10, max 20) | PE files semantically matching description keywords |
-| `search_pe_by_name` | `filename` | Metadata for exact filename match |
+This executes: PDB symbol application → auto-analysis → C++ class extraction → datatype merging → BinExport generation.
 
-#### `fetch_patch_tuesday_cves` output fields
+#### 5. Run BinDiff Analysis
 
-| Field | Description |
-|-------|-------------|
-| `CVE_ID` | CVE identifier |
-| `Title` | Vulnerability title |
-| `Severity` | Critical / Important |
-| `Exploitability` | Exploitation Detected / Exploitation More Likely |
-| `CVSS_BaseScore` | CVSS 3.1 base score |
-| `CVSS_Vector` | Full CVSS vector string |
-| `KB` | KB number patching this CVE on Windows 11 25H2 x64, or `null` if not applicable |
+Use the MCP tool `analyze_bindiff` with the generated `.BinExport` files:
 
-#### `fetch_kb_updated_files` CSV columns
+```
+analyze_bindiff(
+  primary_bin="path/to/old_version.BinExport",
+  secondary_bin="path/to/new_version.BinExport",
+  output_csv=True,
+  verbose=True
+)
+```
 
-| Column | Description |
-|--------|-------------|
-| `file_name` | Binary filename (e.g. `srv2.sys`) |
-| `description` | FileDescription from PE version info on local disk, or empty |
-| `file_version` | Version in this month's KB |
-| `previous_version` | Version in previous month's KB (empty if file is new) |
+Output includes:
+- `*_functions_similarity_stats.csv` — Function-level similarity and confidence scores
+- `*.BinDiff` database — For visual inspection in BinDiff GUI
+
+#### 6. Visual Inspection
+
+Open the `.BinDiff` file in BinDiff GUI for detailed analysis of changed functions.
 
 ---
 
@@ -182,6 +210,22 @@ The workflow is KB-driven: instead of resolving binaries from individual CVE tag
 | `PE_INDEX_COLLECTION` | `pe_files` | ChromaDB collection name for PE index |
 | `PE_INDEX_EMBED_URL` | `http://localhost:1234/v1` | LM Studio embedding endpoint |
 | `PE_INDEX_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5@f32` | Embedding model name |
+
+### BinDiff Analysis MCP Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BINDIFF_PATH` | *(auto-detected)* | Path to BinDiff executable. If not set, searches platform-specific default locations. |
+| `OUTPUT_DIR` | *(same as primary_bin)* | Directory for output files |
+
+### Ghidra MCP Bridge
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GHIDRA_MCP_URL` | `http://127.0.0.1:8089` | Ghidra MCP server URL |
+| `GHIDRA_DEBUGGER_URL` | `http://127.0.0.1:8099` | Ghidra debugger URL |
+| `AUTH_TOKEN` | *(hardcoded)* | Authentication token for remote access |
+| `GHIDRA_MCP_LOG_LEVEL` | `INFO` | Logging level |
 
 ---
 
@@ -198,9 +242,8 @@ The blog post **[CVE-2026-20820 writeup by CravateRouge](https://cravaterouge.co
 ## Project Structure
 
 ```
-patchDiffingNotes/
+patch_tuesday_poc_builder/
 ├── README.md                                    # This file
-├── bindiff_high_roi_to_csv.py                   # BinDiff analysis script
 ├── ghidra_headless_batch_analyzer_docker/       # Containerized Ghidra pipeline
 │   ├── README.md                                # Detailed pipeline documentation
 │   ├── Dockerfile                               # Container build definition
@@ -208,14 +251,20 @@ patchDiffingNotes/
 │   ├── Scripts/                                 # Ghidra analysis scripts
 │   │   ├── CppClassExtractor.py                 # C++ class / vtable recovery
 │   │   ├── DatatypeMerger.py                    # Empty composite backfill from .gdt
-│   │   ├── post_script_export_binexports.py     # Export to BinExport
+│   │   ├── post_script_export_binexports.py    # Export to BinExport
 │   │   ├── Windows_Driver_functons.gdt          # Windows driver function types
 │   │   └── wdk_full_26100.gdt                   # WDK data type archive
 │   └── extensions/                              # BinExport extension
 └── mcp_server/                                  # MCP servers
-    └── patch_tuesday_triage_analysis/
-        ├── fetch_patch_tuesday_interesting_vulns.py  # CVE triage helpers
-        └── patch_tuesday_triage_analysis_mcp_server.py
+    ├── patch_tuesday_triage_analysis/
+    │   ├── patch_tuesday_triage_analysis_mcp_server.py  # CVE triage & KB tools
+    │   └── fetch_patch_tuesday_interesting_vulns.py     # CVE triage helpers
+    ├── bindiff_analysis/
+    │   └── bindiff_analysis_mcp_server.py       # BinDiff analysis (cross-platform)
+    └── ghidra_mcp/
+        ├── bridge_mcp_ghidra.py                 # Ghidra MCP bridge
+        ├── docker-compose.yml                   # Ghidra MCP docker config
+        └── README.md                            # Ghidra MCP setup docs
 ```
 
 > **Note:** Ghidra 11.0.3 PUBLIC must be downloaded separately and placed in

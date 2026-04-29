@@ -1,4 +1,4 @@
-\## this mcp is from \[here](https://github.com/bethington/ghidra-mcp)
+## this mcp is from [here](https://github.com/bethington/ghidra-mcp)
 
 
 
@@ -11,21 +11,14 @@
 
 {
 
-&#x20; "ghidra-mcp": {
-
-&#x20;   "command": "python3",
-
-&#x20;   "args": \["path\\\\to\\\\bridge\_mcp\_ghidra.py","--transport","stdio","--no-lazy"],
-
-&#x20;   "env": {
-
-&#x20;     "GHIDRA\_DEBUGGER\_URL":"http://127.0.0.1:8099",
-
-&#x20;     "GHIDRA\_MCP\_URL":"http://127.0.0.1:8089",
-
-&#x20;     "PYTHONIOENCODING":"utf-8"}
-
-&#x20; }
+ "ghidra-mcp"
+   "command": "python3
+   "args": \["path\\\\to\\\\bridge\_mcp\_ghidra.py","--transport","stdio","--no-lazy"
+   "env"
+     "GHIDRA\_DEBUGGER\_URL":"http://127.0.0.1:8099
+     "GHIDRA\_MCP\_URL":"http://127.0.0.1:8089
+     "PYTHONIOENCODING":"utf-8
+ }
 
 }
 
@@ -33,11 +26,6 @@
 
 
 
-\### NB
+### NB
 
 * For binding on 0.0.0.0 , the use of a AUTH\_TOKEN variable is needed. THIS TOKEN IS HARDCODED IN THE DOCKER-COMPOSE AND THE BRIDGE\_MCP\_GHIDRA\_PY. (for now)
-
-
-
-
-

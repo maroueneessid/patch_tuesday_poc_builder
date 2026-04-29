@@ -947,16 +947,16 @@ def download_patch_binaries(
 
 
 @mcp.tool()
-def list_iat(filename: str) -> Dict[str, Any]:
+def list_iat(filepath: str) -> Dict[str, Any]:
     """List unique DLLs imported by a PE file and their FileDescription.
 
-    Parses the IAT of a PE in C:\\Windows\\System32, collects the unique set
-    of imported DLL names, then reads the FileDescription from each DLL's
-    VS_VERSIONINFO block (when the DLL is also present in System32).
+    Parses the IAT of a PE file, collects the unique set of imported DLL names,
+    then reads the FileDescription from each DLL's VS_VERSIONINFO block
+    (when the DLL is also present in System32).
 
     Args:
-        filename: PE filename, e.g. 'clfs.sys', 'ntoskrnl.exe', 'lsass.exe'.
-                  No path separators allowed.
+        filepath: Full path to PE file, e.g. 'C:\\Windows\\System32\\ntdll.dll',
+                  or just a filename like 'clfs.sys' to search in System32/Drivers.
 
     Returns:
         Dict with keys:
@@ -966,27 +966,31 @@ def list_iat(filename: str) -> Dict[str, Any]:
     """
     result: Dict[str, Any] = {"filepath": None, "dlls": [], "error": None}
 
-    if os.sep in filename or "/" in filename or "\\" in filename:
-        result["error"] = "filename must not contain path separators."
-        return result
-
-    pe_path = _resolve_pe_path(filename)
-    if pe_path is None:
-        result["filepath"] = str(SYSTEM32 / filename)
-        result["error"] = f"'{filename}' not found in {SYSTEM32} or {DRIVERS}."
-        return result
-    result["filepath"] = str(pe_path)
+    # Check if filepath is an absolute path that exists
+    pe_path = Path(filepath)
+    if pe_path.is_absolute() and pe_path.exists():
+        result["filepath"] = str(pe_path)
+    else:
+        # Fall back to searching in System32/Drivers for just a filename
+        pe_path = _resolve_pe_path(filepath)
+        if pe_path is None:
+            result["filepath"] = str(SYSTEM32 / filepath)
+            result["error"] = (
+                f"'{filepath}' not found at given path or in {SYSTEM32} or {DRIVERS}."
+            )
+            return result
+        result["filepath"] = str(pe_path)
 
     try:
-        pe = pefile.PE(str(pe_path), fast_load=True)
+        pe = pefile.PE(str(result["filepath"]), fast_load=True)
         pe.parse_data_directories(
             directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
         )
     except pefile.PEFormatError as exc:
-        result["error"] = f"pefile could not parse '{filename}': {exc}"
+        result["error"] = f"pefile could not parse '{filepath}': {exc}"
         return result
     except OSError as exc:
-        result["error"] = f"Could not read '{filename}': {exc}"
+        result["error"] = f"Could not read '{filepath}': {exc}"
         return result
 
     seen: set = set()
@@ -1012,6 +1016,80 @@ def list_iat(filename: str) -> Dict[str, Any]:
         )
 
     result["dlls"] = dlls
+    return result
+
+
+@mcp.tool()
+def list_export_table(filepath: str) -> Dict[str, Any]:
+    """List exported functions from a PE file's export table.
+
+    Parses the export table (EDT) of a PE file and returns information about
+    each exported symbol including name, ordinal, and address.
+
+    Args:
+        filepath: Full path to PE file, e.g. 'C:\\Windows\\System32\\ntdll.dll',
+                  or just a filename like 'kernel32.dll' to search in System32/Drivers.
+
+    Returns:
+        Dict with keys:
+          filepath — absolute path that was parsed
+          exports  — list of {name, ordinal, address, is_forwarded, forward_target}
+          error    — None on success, error string on failure
+    """
+    result: Dict[str, Any] = {"filepath": None, "exports": [], "error": None}
+
+    # Check if filepath is an absolute path that exists
+    pe_path = Path(filepath)
+    if pe_path.is_absolute() and pe_path.exists():
+        result["filepath"] = str(pe_path)
+    else:
+        # Fall back to searching in System32/Drivers for just a filename
+        pe_path = _resolve_pe_path(filepath)
+        if pe_path is None:
+            result["filepath"] = str(SYSTEM32 / filepath)
+            result["error"] = (
+                f"'{filepath}' not found at given path or in {SYSTEM32} or {DRIVERS}."
+            )
+            return result
+        result["filepath"] = str(pe_path)
+
+    try:
+        pe = pefile.PE(str(result["filepath"]), fast_load=True)
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]]
+        )
+    except pefile.PEFormatError as exc:
+        result["error"] = f"pefile could not parse '{filepath}': {exc}"
+        return result
+    except OSError as exc:
+        result["error"] = f"Could not read '{filepath}': {exc}"
+        return result
+
+    exports = []
+    for entry in getattr(pe, "DIRECTORY_ENTRY_EXPORT", []):
+        for symbol in entry.symbols:
+            name = symbol.name.decode(errors="replace") if symbol.name else None
+            ordinal = symbol.ordinal
+            address = hex(symbol.address) if symbol.address else None
+
+            # Check if this is a forwarded export
+            is_forwarded = bool(symbol.forwarder)
+            forward_target = None
+            if symbol.forwarder:
+                forward_target = symbol.forwarder.decode(errors="replace")
+
+            exports.append(
+                {
+                    "name": name,
+                    "ordinal": ordinal,
+                    "address": address,
+                    "is_forwarded": is_forwarded,
+                    "forward_target": forward_target,
+                }
+            )
+
+    pe.close()
+    result["exports"] = exports
     return result
 
 
