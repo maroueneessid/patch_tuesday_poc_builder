@@ -35,6 +35,7 @@ The Ghidra MCP bridge is from [bethington/ghidra-mcp](https://github.com/bething
 
 ```bash
 git clone https://github.com/bethington/ghidra-mcp
+git checkout a97aa975c85af7ce1c37c5bb619a50e248ca05c8
 cd ghidra-mcp
 docker build -t ghidra-mcp-headless:latest -f docker/Dockerfile .
 ```
@@ -170,8 +171,7 @@ Use the CVE list from step 1 and the file list from step 2 to identify which cha
 docker run --rm \
   -v /path/to/binaries:/input \
   -v /path/to/output:/output \
-  -e GHIDRA_USER=$USER \
-  ghidra-pipeline
+  ghidra-pipeline your_project_name
 ```
 
 This executes: PDB symbol application → auto-analysis → C++ class extraction → datatype merging → BinExport generation.
@@ -206,17 +206,12 @@ Open the `.BinDiff` file in BinDiff GUI for detailed analysis of changed functio
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BASE_DIR` | `./patch_bins` | Output directory for KB updated-files CSVs |
-| `PE_INDEX_DB` | *(not set)* | Path to PE index ChromaDB (enables `search_pe_*` tools) |
-| `PE_INDEX_COLLECTION` | `pe_files` | ChromaDB collection name for PE index |
-| `PE_INDEX_EMBED_URL` | `http://localhost:1234/v1` | LM Studio embedding endpoint |
-| `PE_INDEX_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5@f32` | Embedding model name |
 
 ### BinDiff Analysis MCP Server
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BINDIFF_PATH` | *(auto-detected)* | Path to BinDiff executable. If not set, searches platform-specific default locations. |
-| `OUTPUT_DIR` | *(same as primary_bin)* | Directory for output files |
 
 ### Ghidra MCP Bridge
 
@@ -272,7 +267,9 @@ patch_tuesday_poc_builder/
 > Download: [ghidra_11.0.3_PUBLIC_20240410.zip](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.3_build/ghidra_11.0.3_PUBLIC_20240410.zip)
 
 ---
+## TO DOs
 
-## License
-
-This project is provided as-is for educational and research purposes.
+- Add individual PDB download to the patch_tuesday mcp server . Use `symchk` against individual binary. (in case false download)
+- Add finding unmatched functions between diffs not only similarities between functions in the Bindiff analysis mcp.
+- Configure [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) into a docker container but with Multi instance ghidra (to use multiple agent on different ghidra project simultaneously). 
+- Find a the most stable and working verion of [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) and pin in this project.
