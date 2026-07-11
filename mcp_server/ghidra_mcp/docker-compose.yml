@@ -1,6 +1,7 @@
 services:
   ghidra-mcp:
     image: ghidra-mcp-headless:latest
+    restart: unless-stopped
     ports:
       - "8089:8089"
     volumes:
