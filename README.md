@@ -271,5 +271,6 @@ patch_tuesday_poc_builder/
 
 - Add individual PDB download to the patch_tuesday mcp server . Use `symchk` against individual binary. (in case false download)
 - Add finding unmatched functions between diffs not only similarities between functions in the Bindiff analysis mcp.
+- in `patch_tuesday_mcp`, figure out why the handle of last downloaded binaries isn't released
 - Configure [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) into a docker container but with Multi instance ghidra (to use multiple agent on different ghidra project simultaneously). 
 - Find a the most stable and working verion of [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) and pin in this project.

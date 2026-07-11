@@ -1,6 +1,0 @@
-- Only generate code when asked
-- When generating code , do not write a full fledge README.md documentation unless asked. just basic use of the software in couple of lines is sufficient
-- When talking/using about 3rd party libraries in python or other (especially languages that are always updated or libraries that are know to break backwards compatibility) , always prioritize web searches to find the repo name, the use the deepwiki mcp tools to analyze that repo or context7 mcp tool
- - Debug and verbose output should always be included as an option , but beautification of the output like ASCII art or banners and ASCII tables should not be used , unless it is integral part of the task , like actually building some kind of table output. If colors are used , these should be basic (red for erros , green for success and yellow for warning/info)
- - Code steps that are about some kind of extraction (array slicing , bit shiftting etc ...) should always be commented and explained . 
- - Always prioritize use of standard libraries before jumping into using 3rd parties. 
