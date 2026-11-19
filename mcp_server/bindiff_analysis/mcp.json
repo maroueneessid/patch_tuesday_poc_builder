@@ -1,7 +1,0 @@
-{
-  "bindiff-analysis": {
-    "command": "python3",
-    "args": ["path\\to\\bindiff_analysis_mcp_server.py"],
-    "env": {}
-  }
-}
