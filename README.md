@@ -1,276 +1,157 @@
-# AI Assistance in Windows Internals Reverse Engineering and Patch Diffing Toolkit
+# Windows Internals RE & Patch Diffing Toolkit
 
----
+AI-assisted toolkit for Microsoft Patch Tuesday analysis: CVE triage from MSRC, KB-driven
+binary discovery, patched-vs-vulnerable **diffing with ghidriff**, decompile/xref analysis
+through **Ghidra MCP**, and **Hyper-V/KDNET** dynamic validation for PoC work.
 
-## Overview
+Streamlined 2026-11-19: the BinDiff MCP server and the legacy Ghidra 11.0.3 batch analyzer
+were removed — ghidriff is the single diffing engine. The pipeline is validated end-to-end
+on the CVE-2026-105501 Windows Installer EoP cluster, including the server handoff
+(load → search → decompile → callers) and the downstream triage/decompile/xref battery.
 
-This project provides an automated toolkit for triaging CVEs from Microsoft Patch Tuesday, identifying updated binaries via KB file manifests, and using Ghidra + BinDiff to analyze binary differences. It consists of three main components:
+## Pipeline at a glance
 
-1. **Patch Diffing Workflow** — Automated tools for CVE triage, KB file discovery, and binary diffing analysis.
+```
+MSRC / WinBIndex (patch-tuesday MCP)          CVE triage + binary discovery + download
+        ↓
+ghidriff  (ghidriff/run_diff.sh)              PDB auto-download + full analysis + diff
+        ↓  writes
+<BASE>/ghidra_projects/  +  <BASE>/Analysis/<CVE-CHAIN>/ghidriff/
+        ↓
+ghidra-mcp bridge                             open_project → load_program → search/decompile/xref
+        ↓
+<BASE>/Analysis/<CVE-CHAIN>/                  findings per vulnerability-research-methodology
+        ↓
+hyperv-mcp + kd-mcp                           dynamic validation of PoC ideas on Win11Poc
+```
 
-2. **Ghidra Headless Batch Analyzer** — A containerized, headless batch analysis pipeline built around Ghidra 11.0.3. It automates importing Windows binaries, applying PDB symbols, running C++ class recovery and datatype enrichment scripts, and exporting results to BinExport format.
+Component inventory: `ghidriff/` (diffing scripts + README), `skills/` (five agent skills),
+`mcp_server/` (patch-tuesday triage, ghidra-mcp bridge, hyperv-mcp, kd-mcp).
+Removed: `bindiff_analysis` server, `ghidra_headless_batch_analyzer_docker`.
+The removed components' scripts live in git history if ever needed again.
 
-3. **MCP Servers** — Three Model Context Protocol servers for AI assistant integration:
-   - **Patch Tuesday Triage** — CVE triage and KB file discovery
-   - **BinDiff Analysis** — Cross-platform BinDiff analysis with automatic platform detection
-   - **Ghidra MCP Bridge** — Direct Ghidra integration for interactive analysis
+## Workspace contract — works anywhere
 
-> **See [ghidra_headless_batch_analyzer_docker/README.md](ghidra_headless_batch_analyzer_docker/README.md) for detailed documentation on the Ghidra pipeline, including build instructions, usage, and technical issues encountered during development.**
+Everything derives from `<BASE>`, auto-detected by the scripts (walk-up from the script's
+own directory) or set explicitly via `DIFFING_BASE_DIR`:
 
----
+```
+<BASE>/
+├── diffs/<CVE_CHAIN>/                staged binaries: 2 versions + 2 PDBs, <module>_<version> names
+├── ghidra_projects/                  Ghidra projects — the MCP server mounts this as /projects
+├── Analysis/<CVE_CHAIN>/ghidriff/    outputs: .ghidriff.md/.json, ghidriff.log, gzfs/, symbols/
+├── .ghidra_pin/<version>/            pinned Ghidra (auto-created from the MCP server's container)
+├── cves_<YYYY_MMM>.md                triage outputs (root)
+├── kb_files_<KB>.md                  KB file manifest + cve_file_mapping.md (root)
+└── fix_ownership.ps1                 workspace helper
+```
 
-## Components
+CVE dirs chain with underscores (`CVE-A_CVE-B_CVE-C`); binaries keep `<module>_<version>`
+names; **old/vulnerable version listed first everywhere**.
 
-### MCP Servers
+## Setup — pragmatic steps
 
-| Server | Purpose |
-|--------|---------|
-| `mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py` | CVE triage, KB file discovery, IAT analysis, and PE index search |
-| `mcp_server/bindiff_analysis/bindiff_analysis_mcp_server.py` | BinDiff headless analysis with cross-platform support (Windows/Linux) |
-| `mcp_server/ghidra_mcp/bridge_mcp_ghidra.py` | Ghidra MCP bridge for direct Ghidra integration |
-
-### Ghidra MCP Bridge Setup
-
-The Ghidra MCP bridge is from [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp). To set up:
+1. **Docker Desktop** running (the only hard prerequisite for the containers).
+2. **Start the ghidra-mcp headless server** — image `ghidra-mcp-headless:latest`:
 
 ```bash
-git clone https://github.com/bethington/ghidra-mcp
-git checkout a97aa975c85af7ce1c37c5bb619a50e248ca05c8
-cd ghidra-mcp
+git clone https://github.com/bethington/ghidra-mcp /tmp/ghidra-mcp
+cd /tmp/ghidra-mcp && git checkout a97aa975c85af7ce1c37c5bb619a50e248ca05c8
 docker build -t ghidra-mcp-headless:latest -f docker/Dockerfile .
 ```
 
-**MCP Configuration:**
+   Wire the volumes with this repo's compose (`mcp_server/ghidra_mcp/docker-compose.yml`)
+   — it interpolates `${DIFFING_BASE_DIR}` with this machine's default baked in:
+
+```bash
+DIFFING_BASE_DIR=/path/to/your/<BASE> docker compose -f mcp_server/ghidra_mcp/docker-compose.yml up -d
+```
+
+3. **Patch-tuesday MCP** in the agent's client config:
+
 ```json
-{
-  "ghidra-mcp": {
-    "command": "python3",
-    "args": ["path/to/bridge_mcp_ghidra.py", "--transport", "stdio", "--no-lazy"],
-    "env": {
-      "GHIDRA_DEBUGGER_URL": "http://127.0.0.1:8099",
-      "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
-      "PYTHONIOENCODING": "utf-8"
-    }
+"patch-tuesday": {
+  "command": "python",
+  "args": ["<repo>/mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py"],
+  "env": { "BASE_DIR": "<BASE>/diffs" }
+},
+"ghidra-mcp": {
+  "command": "python",
+  "args": ["<repo>/mcp_server/ghidra_mcp/bridge_mcp_ghidra.py", "--transport", "stdio", "--no-lazy"],
+  "env": {
+    "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
+    "GHIDRA_DEBUGGER_URL": "http://127.0.0.1:8099",
+    "PYTHONIOENCODING": "utf-8"
   }
 }
 ```
 
-> **Note:** For binding on 0.0.0.0, an `AUTH_TOKEN` variable is required (hardcoded in docker-compose and bridge script).
-
----
-
-## Ghidra Scripts
-
-Located in `ghidra_headless_batch_analyzer_docker/Scripts/`:
-
-| Script | Purpose |
-|--------|---------|
-| `CppClassExtractor.py` | Recovers C++ class structure from MSVC-compiled binaries using decompiler output. Identifies vtables, constructors, and infers member fields from typed assignments. |
-| `DatatypeMerger.py` | Backfills empty/undefined composite types by matching names against external `.gdt` archives (e.g., WDK type libraries). |
-| `post_script_export_binexports.py` | Exports the current program to a `.BinExport` file for BinDiff analysis. |
-
-**GDT Archives:**
-- `wdk_full_26100.gdt` — Windows Driver Kit type definitions for Windows 26100
-- `Windows_Driver_functons.gdt` — Windows driver function types
-
-For detailed documentation on what each script does, see the [Ghidra pipeline README](ghidra_headless_batch_analyzer_docker/README.md#what-each-script-does).
-
----
-
-## Setup
-
-### Prerequisites
-
-- **Ghidra 11.0.3 PUBLIC** — Download from [official release](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.3_build/ghidra_11.0.3_PUBLIC_20240410.zip)
-- **BinExport extension** — Install via Ghidra File → Install Extensions
-- **BinDiff** — Install from [zynamics](https://www.zynamics.com/bindiff.html)
-- **Python 3.10+** with required packages
-- **Docker** (for Ghidra headless pipeline)
-- **LM Studio** running locally at `http://localhost:1234` (for PE index embedding, optional)
-
-### Install Python Dependencies
+4. **ghidriff** (no other install — one image pull):
 
 ```bash
-pip install requests beautifulsoup4 pefile chromadb openai mcp
+docker pull ghcr.io/clearbluejar/ghidriff:latest
+./ghidriff/install_pinned_ghidra.sh      # one-time: pins the server's exact Ghidra into <BASE>/.ghidra_pin/<ver>
 ```
 
-### MCP Client Configuration
+5. **Deploy the agent skills** — copy `skills/*` next to your agent's skill directory
+   (project `.agents/skills/` or global `~/.agents/skills/`). They are the operational
+   manual: `ghidriff-pipeline` (master workflow), `ghidra-mcp` (server usage),
+   `vulnerability-research-methodology`, `patcht-tuesday-triage-skill`,
+   `hyperv-kdnet-kd-mcp` (dynamic testing).
 
-```json
-{
-  "mcpServers": {
-    "patch-tuesday": {
-      "command": "python",
-      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/patch_tuesday_triage_analysis/patch_tuesday_triage_analysis_mcp_server.py"],
-      "env": {
-        "BASE_DIR": "C:/path/to/patch_bins"
-      }
-    },
-    "bindiff-analysis": {
-      "command": "python",
-      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/bindiff_analysis/bindiff_analysis_mcp_server.py"],
-      "env": {
-        "BINDIFF_PATH": "C:/path/to/bindiff.exe"
-      }
-    },
-    "ghidra-mcp": {
-      "command": "python",
-      "args": ["C:/path/to/patch_tuesday_poc_builder/mcp_server/ghidra_mcp/bridge_mcp_ghidra.py", "--transport", "stdio", "--no-lazy"],
-      "env": {
-        "GHIDRA_MCP_URL": "http://127.0.0.1:8089",
-        "PYTHONIOENCODING": "utf-8"
-      }
-    }
-  }
-}
-```
+Python deps for the MCP servers (host side): `pip install requests beautifulsoup4 pefile chromadb openai mcp`.
+Optional: LM Studio at `http://localhost:1234` for PE-index embedding.
 
-### Ghidra Headless Pipeline Setup
+## Quick start — one CVE cluster, end to end
 
-See the [Ghidra pipeline README](ghidra_headless_batch_analyzer_docker/README.md) for:
-- Docker build instructions
-- Native (non-Docker) usage
-- Environment variables
-- Troubleshooting technical issues
+1. Triage gates: write `cves_<YYYY_MMM>.md`, `kb_files_<KB>.md`, `cve_file_mapping.md`
+   (tools `fetch_patch_tuesday_cves` / `fetch_kb_updated_files`; rules in the triage skill).
+2. `download_patch_binaries(filename, patch_month, windows_version)` → land in `<BASE>/diffs/`
+   root; move both pairs per cluster into `diffs/<CVE_CHAIN>/` (WinBIndex tells you the REAL
+   vulnerable baseline — trust it over table guesses).
+3. `ghidriff/run_diff.sh --check-only <CVE_CHAIN> <PROJECT_NAME> <old_bin> <new_bin>`
+    (gates + staging rehearsal, launches nothing), then drop `--check-only` for the run.
+4. Follow the printed handoff:
+   `open_project('/projects/<proj>/<proj>.gpr')` →
+   `load_program_from_project('/<name>-<hash6>')` → query tools with `program='<filename>'`.
+5. Triage the `.ghidriff.md` / `json/*.ghidriff.json` per `vulnerability-research-methodology`
+   (Tier 0 = the Added section); write findings into `<BASE>/Analysis/<CVE_CHAIN>/`.
+6. When a PoC needs a live machine: hyperv/kd per `hyperv-kdnet-kd-mcp`.
 
----
+## Environment variables
 
-## Usage
+| Variable | Where | Purpose |
+|---|---|---|
+| `DIFFING_BASE_DIR` | run_diff.sh / install script / compose | workspace root; auto-detected otherwise |
+| `GHIDRA_PIN_DIR` | run_diff.sh | explicit pinned-Ghidra override (default `<BASE>/.ghidra_pin/<ver>`) |
+| `GHIDRA_MCP_CONTAINER` | scripts | server container name (default `ghidra_mcp-ghidra-mcp-1`) |
+| `GHIDRIFF_IMAGE` / `GHIDRIFF_TIMEOUT_SEC` | run_diff.sh | image / completion timeout (default 3600) |
+| `GHIDRA_MCP_PORT` / `GHIDRA_MCP_AUTH_TOKEN` / `JAVA_OPTS` | compose | server wiring |
+| `BASE_DIR` | patch-tuesday MCP | `<BASE>/diffs` (KB CSVs + downloads land here) |
 
-### Patch Diffing Workflow
+## Gotchas — (deliberately short; the scripts absorb the rest)
 
-The workflow is KB-driven: instead of resolving binaries from individual CVE tags, it fetches Microsoft's official file-version manifest for the month's cumulative update and diffs it against the previous month to find files that actually changed version.
+- **Version gate / ownership gate stop = informational**: `run_diff.sh` self-heals pin
+  provisioning; a hard stop only fires when the *server* side changed meaningfully — follow
+  the printed guidance and re-run `install_pinned_ghidra.sh`. Never monkey-patch either side.
+- **The patch-tuesday MCP keeps file handles open** after downloads: a `Device or resource
+  busy` move → `sleep 8` retry, then `cp -f` + `rm -f` fallback. Root fix still pending
+  (see TODOs).
+- `ghidriff.log` **appends** across runs — always read its tail.
+- The MCP jar holds **one project open** — `close_project` before pointing it at another
+  diff project.
 
-**Supported platform:** Windows 11 25H2 x64 only.
+## Remaining TODOs
 
-#### 1. Triage CVEs
+- Per-binary PDB fallback download via `symchk` in the patch-tuesday MCP (only if WinBIndex
+  misses a file).
+- Root-fix the lingering handle release in the patch-tuesday MCP downloader.
+- Multi-instance ghidra-mcp for parallel agents — one headless jar serves one open project,
+  so this means N containers + N bridges on N ports.
 
-```bash
-python mcp_server/patch_tuesday_triage_analysis/fetch_patch_tuesday_interesting_vulns.py --month 2025-04
-```
+## Recommended reading
 
-Or use the MCP tool `fetch_patch_tuesday_cves` to get high-exploitability CVEs (`Exploitation Detected` / `Exploitation More Likely`) with severity, CVSS score, and the KB number that patches them on 25H2.
-
-#### 2. Discover Updated Binaries
-
-Use the MCP tool `fetch_kb_updated_files`:
-- Resolves the cumulative update KB from MSRC CVRF
-- Downloads the file-version CSV from `support.microsoft.com/help/{KB}`
-- Filters for x64 `.exe`/`.dll`/`.sys` files
-- Diffs against the previous month's KB to find version-changed files only
-- Enriches each entry with `FileDescription` from the local PE on disk
-- Saves a CSV to `BASE_DIR/{month}_KB{kb}_11-25H2_updated_files.csv`
-
-#### 3. Cross-Reference CVEs with Updated Binaries
-
-Use the CVE list from step 1 and the file list from step 2 to identify which changed binaries are associated with high-exploitability vulnerabilities.
-
-#### 4. Analyze with Ghidra Headless Pipeline
-
-```bash
-docker run --rm \
-  -v /path/to/binaries:/input \
-  -v /path/to/output:/output \
-  ghidra-pipeline your_project_name
-```
-
-This executes: PDB symbol application → auto-analysis → C++ class extraction → datatype merging → BinExport generation.
-
-#### 5. Run BinDiff Analysis
-
-Use the MCP tool `analyze_bindiff` with the generated `.BinExport` files:
-
-```
-analyze_bindiff(
-  primary_bin="path/to/old_version.BinExport",
-  secondary_bin="path/to/new_version.BinExport",
-  output_csv=True,
-  verbose=True
-)
-```
-
-Output includes:
-- `*_functions_similarity_stats.csv` — Function-level similarity and confidence scores
-- `*.BinDiff` database — For visual inspection in BinDiff GUI
-
-#### 6. Visual Inspection
-
-Open the `.BinDiff` file in BinDiff GUI for detailed analysis of changed functions.
-
----
-
-## Environment Variables Reference
-
-### Patch Tuesday MCP Server
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BASE_DIR` | `./patch_bins` | Output directory for KB updated-files CSVs |
-
-### BinDiff Analysis MCP Server
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BINDIFF_PATH` | *(auto-detected)* | Path to BinDiff executable. If not set, searches platform-specific default locations. |
-
-### Ghidra MCP Bridge
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GHIDRA_MCP_URL` | `http://127.0.0.1:8089` | Ghidra MCP server URL |
-| `GHIDRA_DEBUGGER_URL` | `http://127.0.0.1:8099` | Ghidra debugger URL |
-| `AUTH_TOKEN` | *(hardcoded)* | Authentication token for remote access |
-| `GHIDRA_MCP_LOG_LEVEL` | `INFO` | Logging level |
-
----
-
-## Recommended Reading
-
-The blog post **[CVE-2026-20820 writeup by CravateRouge](https://cravaterouge.com/articles/cve-2026-20820/)** is highly recommended. It demonstrates this exact workflow end-to-end and covers:
-
-- How to use jsacco's Ghidra GDT for Windows kernel types (relevant to `DatatypeMerger.py`)
-- C++ class recovery with `CppClassExtractor.py`
-- Patch diffing methodology with BinDiff
-
----
-
-## Project Structure
-
-```
-patch_tuesday_poc_builder/
-├── README.md                                    # This file
-├── ghidra_headless_batch_analyzer_docker/       # Containerized Ghidra pipeline
-│   ├── README.md                                # Detailed pipeline documentation
-│   ├── Dockerfile                               # Container build definition
-│   ├── headless_analyze.py                      # Python entrypoint (pyhidra)
-│   ├── Scripts/                                 # Ghidra analysis scripts
-│   │   ├── CppClassExtractor.py                 # C++ class / vtable recovery
-│   │   ├── DatatypeMerger.py                    # Empty composite backfill from .gdt
-│   │   ├── post_script_export_binexports.py    # Export to BinExport
-│   │   ├── Windows_Driver_functons.gdt          # Windows driver function types
-│   │   └── wdk_full_26100.gdt                   # WDK data type archive
-│   └── extensions/                              # BinExport extension
-└── mcp_server/                                  # MCP servers
-    ├── patch_tuesday_triage_analysis/
-    │   ├── patch_tuesday_triage_analysis_mcp_server.py  # CVE triage & KB tools
-    │   └── fetch_patch_tuesday_interesting_vulns.py     # CVE triage helpers
-    ├── bindiff_analysis/
-    │   └── bindiff_analysis_mcp_server.py       # BinDiff analysis (cross-platform)
-    └── ghidra_mcp/
-        ├── bridge_mcp_ghidra.py                 # Ghidra MCP bridge
-        ├── docker-compose.yml                   # Ghidra MCP docker config
-        └── README.md                            # Ghidra MCP setup docs
-```
-
-> **Note:** Ghidra 11.0.3 PUBLIC must be downloaded separately and placed in
-> `ghidra_headless_batch_analyzer_docker/ghidra_11.0.3_PUBLIC/`.  
-> Download: [ghidra_11.0.3_PUBLIC_20240410.zip](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.3_build/ghidra_11.0.3_PUBLIC_20240410.zip)
-
----
-## TO DOs
-
-- Add individual PDB download to the patch_tuesday mcp server . Use `symchk` against individual binary. (in case false download)
-- Add finding unmatched functions between diffs not only similarities between functions in the Bindiff analysis mcp.
-- in `patch_tuesday_mcp`, figure out why the handle of last downloaded binaries isn't released
-- Configure [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) into a docker container but with Multi instance ghidra (to use multiple agent on different ghidra project simultaneously). 
-- Find a the most stable and working verion of [bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) and pin in this project.
+[CravateRouge's CVE-2026-20820 writeup](https://cravaterouge.com/articles/cve-2026-20820/) —
+end-to-end demo of the same methodology (the class-recovery / GDT-typing pieces it describes
+map to the removed legacy scripts, both recoverable from git history; PDB symbol application
+is now automatic inside ghidriff).

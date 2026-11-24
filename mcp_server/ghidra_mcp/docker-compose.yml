@@ -5,8 +5,8 @@ services:
     ports:
       - "8089:8089"
     volumes:
-      - C:\Users\User\Desktop\DiffingBaseDir\ghidra_projects:/projects
-      - C:\Users\User\Desktop\DiffingBaseDir\diffs:/diffs
+      - ${DIFFING_BASE_DIR:-C:/Users/User/Desktop/DiffingBaseDir}/ghidra_projects:/projects
+      - ${DIFFING_BASE_DIR:-C:/Users/User/Desktop/DiffingBaseDir}/diffs:/diffs
     environment:
       - GHIDRA_MCP_PORT=8089
       - GHIDRA_MCP_AUTH_TOKEN=VVfCkbUUGkwstWwPJ8BKm7kL8jw1hJHY
